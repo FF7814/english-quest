@@ -1,11 +1,13 @@
 /* 英语启航 - 离线缓存 Service Worker
  * 策略：网络优先、离线回退缓存。只要联网打开就是最新版本，断网时用已缓存的内容离线使用。
  */
-const CACHE = 'englishquest-v21';
+const CACHE = 'englishquest-v29';
 const FILES = [
   './',
   './index.html',
   './css/style.css',
+  './js/cet4.js',
+  './js/cet4_exam.js',
   './js/data.js',
   './js/app.js',
   './manifest.webmanifest',

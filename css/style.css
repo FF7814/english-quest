@@ -258,6 +258,49 @@ main{max-width:1080px;margin:0 auto;padding:20px 18px 40px}
 .dict-compare .val{font-size:15px;font-weight:700;word-break:break-word}
 .dict-compare .val.right{color:var(--purple)}
 
+
+.stat-link{cursor:pointer;border:0;font-family:inherit;text-align:inherit;transition:transform .12s,box-shadow .12s}
+.stat-link:active{transform:scale(.96)}
+.stat-link:hover{box-shadow:0 4px 14px rgba(108,92,231,.18)}
+
+.arch-back{background:var(--purple-pale);color:var(--purple);border:none;border-radius:999px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer}
+.arch-back:active{transform:scale(.96)}
+
+.arch-tabs{display:flex;gap:6px;overflow-x:auto;padding:2px 0 8px;margin-bottom:6px;-webkit-overflow-scrolling:touch}
+.arch-tab{flex:0 0 auto;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:8px 13px;font-size:13px;font-weight:700;color:var(--text);cursor:pointer;white-space:nowrap;display:flex;align-items:center;gap:6px}
+.arch-tab.active{background:var(--purple);color:#fff;border-color:var(--purple)}
+.arch-num{background:rgba(108,92,231,.14);color:var(--purple);border-radius:999px;padding:1px 7px;font-size:11px}
+.arch-tab.active .arch-num{background:rgba(255,255,255,.25);color:#fff}
+.arch-search{margin:6px 0 8px}
+.arch-search input{width:100%;box-sizing:border-box;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:11px 14px;font-size:14px;color:var(--text);outline:none}
+.arch-search input:focus{border-color:var(--purple)}
+.arch-meta{font-size:12px;color:var(--muted);margin:2px 2px 8px}
+.arch-list{display:flex;flex-direction:column;gap:8px;padding-bottom:20px}
+.arch-item{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px}
+.arch-row{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.arch-main{font-size:16px;font-weight:800;color:var(--text);line-height:1.4;word-break:break-word}
+.arch-play{flex:0 0 auto;background:var(--purple-pale);color:var(--purple);border:none;border-radius:10px;width:38px;height:38px;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.arch-play:active{transform:scale(.92)}
+.arch-ph{font-size:13px;color:var(--purple);margin-top:3px}
+.arch-cn{font-size:14px;color:var(--text);margin-top:3px}
+.arch-sub{font-size:12px;color:var(--muted);margin-top:3px;line-height:1.4}
+.arch-foot{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:11px}
+
+/* 导出学习内容选择 */
+.exp-list{display:flex;flex-direction:column;gap:8px;margin:12px 0}
+.exp-item{display:flex;align-items:center;gap:10px;padding:11px 12px;border:1.5px solid var(--line);border-radius:13px;background:var(--card);cursor:pointer;transition:.15s}
+.exp-item.on{border-color:var(--purple);background:var(--purple-pale)}
+.exp-item input{width:18px;height:18px;accent-color:var(--purple);flex:0 0 auto}
+.exp-ic{font-size:20px;flex:0 0 auto}
+.exp-body{flex:1;min-width:0}
+.exp-body b{display:block;font-size:14px;color:var(--text)}
+.exp-body small{display:block;font-size:11px;color:var(--muted);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exp-count{flex:0 0 auto;font-size:12px;font-weight:700;color:var(--purple)}
+.exp-scope{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 10px;font-size:13px;font-weight:700;color:var(--text)}
+.exp-scope .arch-tab{font-size:12px}
+.exp-actions{display:flex;gap:8px;margin-bottom:12px}
+.exp-actions .btn{flex:1}
+
 .progress-dots{display:flex;gap:5px;margin-bottom:14px}
 .progress-dots i{flex:1;height:5px;border-radius:9px;background:var(--line)}
 .progress-dots i.on{background:var(--purple)}

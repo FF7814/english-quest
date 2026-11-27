@@ -101,6 +101,14 @@ const App = (function () {
     const idx = Math.round((c - 1) * (totalDays() - 1) / (SOURCE_DAYS - 1));
     return clamp(idx + 1, 1, totalDays());
   }
+  // 计划按用户真实情况固定：只认识字母名，不认识音标/单词/语法/句子。
+  // 因此不提供中学/大学基础切换，任何一天都从同一份启蒙课程表推进，不跳过字母音、音标和自然拼读。
+  function effectiveCourseDay(c) { return c; }
+  // 按每日可学时长微调单词量，保证任务量合理
+  function dailyWordCount(base) {
+    const m = state.minutes || 33;
+    return clamp(Math.round(base * (m <= 15 ? 0.6 : m >= 45 ? 1.3 : 1)), 2, 14);
+  }
 
   /* ---------- 基础工具 ---------- */
   function defaults() {
@@ -109,7 +117,8 @@ const App = (function () {
       learnedWords: {}, completed: {}, badges: [], mockScores: [], rate: 0.85, srs: {}, xpLog: {},
       owed: [], misses: 0, lastGap: 0, lastPenaltyDate: null, comeback: null, comebackDone: 0,
       voiceURI: '', voiceFx: true, feedbackVoice: '', feedbackTone: 'funny', feedbackLang: 'zh',
-      voiceProfile: null,
+      voiceProfile: null, naturalVoice: true,
+      level: 'zero', target: 'cet4', wrongBook: {}, writings: {}, translations: {}, transHistory: {},
       customAudio: { read: {}, feedback: {} }, videos: {}
     };
   }
@@ -120,6 +129,13 @@ const App = (function () {
     s.targetDays = (s.targetDays && s.targetDays !== 730) ? s.targetDays : 670;
     s.minutes = (s.minutes && s.minutes !== 30) ? s.minutes : 33;
     if (s.voiceURI === undefined) s.voiceURI = '';
+    if (s.naturalVoice === undefined) s.naturalVoice = true;
+    s.level = 'zero'; // 固定为只认识字母的起点；旧存档若曾选过其他水平，也统一回到真实起点
+    if (!s.target) s.target = 'cet4';
+    if (!s.wrongBook || typeof s.wrongBook !== 'object') s.wrongBook = {};
+    if (!s.writings || typeof s.writings !== 'object') s.writings = {};
+    if (!s.translations || typeof s.translations !== 'object') s.translations = {};
+    if (!s.transHistory || typeof s.transHistory !== 'object') s.transHistory = {};
     if (s.voiceFx === undefined) s.voiceFx = true;
     if (s.feedbackVoice === undefined) s.feedbackVoice = '';
     if (!s.feedbackTone || !FEEDBACK_LINES[s.feedbackTone]) s.feedbackTone = 'funny';
@@ -296,20 +312,20 @@ const App = (function () {
   // 第 91 课程日起恢复原计划：语法 + 整句听力 / 阅读 / 口语 / 模考
   function planForDay(day) {
     day = clamp(Math.floor(day || 1), 1, totalDays());
-    const c = courseDay(day);
+    const c = effectiveCourseDay(courseDay(day));
     const phase = phaseOf(day);
 
     // 词汇：启蒙期少而精、循环巩固；成长期起按量推进
     let wordSrc, count, wStart;
     if (c <= 44) {
-      wordSrc = EASY_WORDS; count = 4;
+      wordSrc = EASY_WORDS; count = dailyWordCount(4);
       wStart = ((c - 1) * 4) % Math.max(1, EASY_WORDS.length - count);
     } else if (c <= 90) {
-      wordSrc = ALL_WORDS; count = 6;
+      wordSrc = ALL_WORDS; count = dailyWordCount(6);
       wStart = 55 + ((c - 45) * 6) % Math.max(1, ALL_WORDS.length - 55 - count);
     } else {
-      wordSrc = ALL_WORDS; count = 10;
-      wStart = ((c - 91) * count) % Math.max(1, ALL_WORDS.length - count);
+      wordSrc = ALL_WORDS; count = dailyWordCount(10);
+      wStart = ((c - 91) * 10) % Math.max(1, ALL_WORDS.length - count);
     }
     const words = wordSrc.slice(wStart, wStart + count);
     const srcKey = wordSrc === EASY_WORDS ? 'easy' : 'all';
@@ -356,22 +372,23 @@ const App = (function () {
       const idx = [base, base+1, base+2, base+3];
       third = { id:'c', icon:'🎧', name:'听词选义', desc:'听已学过的单词，选出中文意思', xp:20, mod:'listening', cfg:{ kind:'word', idx } };
     } else {
-      const mode = (c - 1) % 4;
+      const mode = (c - 1) % 6;
       if (mode === 0) {
-        const li = (c * 2) % LISTEN_BANK.length;
-        third = { id:'c', icon:'🎧', name:'听力训练', desc:'第 '+(li+1)+' 句：'+LISTEN_BANK[li][0], xp:20, mod:'listening', cfg:{ idx:[li,(li+7)%LISTEN_BANK.length,(li+13)%LISTEN_BANK.length,(li+21)%LISTEN_BANK.length] } };
+        third = { id:'c', icon:'🎧', name:'四级听力训练', desc:'新闻/对话/讲座 · 5 题', xp:20, mod:'cenListening', cfg:{ seed:c } };
       } else if (mode === 1) {
-        const passPool = PASSAGES.filter(p => p.lvl <= Math.min(4, phase.id));
-        const pi = c % passPool.length;
-        third = { id:'c', icon:'📚', name:'阅读闯关', desc:'短文《'+passPool[pi].title+'》· 2 道理解题', xp:20, mod:'reading', cfg:{ idx:pi } };
+        const p = CET4_CAREFUL[c % CET4_CAREFUL.length];
+        third = { id:'c', icon:'📚', name:'仔细阅读', desc:'《'+p.title+'》· '+p.qs.length+' 题', xp:20, mod:'cenReading', cfg:{ kind:'careful', seed:c } };
       } else if (mode === 2) {
+        const w = CET4_WRITING[c % CET4_WRITING.length];
+        third = { id:'c', icon:'✍️', name:'四级写作', desc:'《'+w.title+'》· 范文对照', xp:20, mod:'writing', cfg:{ id:w.id } };
+      } else if (mode === 3) {
+        const t = CET4_TRANSLATION[c % CET4_TRANSLATION.length];
+        third = { id:'c', icon:'🌏', name:'四级翻译', desc:'汉译英 · '+t.cn.slice(0,14)+'…', xp:20, mod:'translation', cfg:{ id:t.id } };
+      } else if (mode === 4) {
         const ti = (c - 1) % SPEAK_TOPICS.length;
         third = { id:'c', icon:'🎤', name:'口语跟读', desc:'话题 '+(ti+1)+'：'+SPEAK_TOPICS[ti].q, xp:20, mod:'speaking', cfg:{ idx:ti } };
-      } else if (phase.id >= 3) {
-        third = { id:'c', icon:'📝', name:'四级模考', desc:'第 '+c+' 套综合卷 · 10 题', xp:30, mod:'mock', cfg:{ seed:c } };
       } else {
-        const li = (c * 3) % LISTEN_BANK.length;
-        third = { id:'c', icon:'🎧', name:'听力加练', desc:'第 '+(li+1)+' 句：'+LISTEN_BANK[li][0], xp:20, mod:'listening', cfg:{ idx:[li,(li+5)%LISTEN_BANK.length,(li+11)%LISTEN_BANK.length,(li+17)%LISTEN_BANK.length] } };
+        third = { id:'c', icon:'📝', name:'四级真题模考', desc:'完整流程 · 听力+词汇+阅读+翻译+写作', xp:30, mod:'mockFull', cfg:{ seed:c } };
       }
     }
 
@@ -409,16 +426,14 @@ const App = (function () {
 
   /* ---------- 奖励与成就 ---------- */
   function award(xp) { state.xp += xp; saveState(); checkBadges(); updateHeader(); }
-  // 同一项每天只发一次固定经验值：重复完成不再累加
-  function awardOnce(key, xp) {
-    const day = dateKey();
-    if (!state.xpLog[day]) state.xpLog[day] = {};
-    if (Object.prototype.hasOwnProperty.call(state.xpLog[day], key)) return 0;
-    state.xpLog[day][key] = xp;
-    award(xp);
-    return xp;
+  // 任务积分 = 任务最高分 × 答对题数 / 总题数；例如 20 分 4 题，答对 2 题得 10 分
+  function taskXpFor(task, correct, total) {
+    if (!task || !task.xp || !total || total <= 0) return 0;
+    return clamp(Math.round(task.xp * (correct || 0) / total), 0, task.xp);
   }
-  function completeTask(id, xp) {
+  function taskById(id) { return dailyTasks().find(t => t.id === id); }
+  // 同一任务当天累计发放，取历史最高分补差额：先答对 2 题拿 10 分，重做答对 4 题再补 10 分，最多拿满任务分
+  function completeTask(id, targetXp) {
     const key = todayTasksKey();
     if (!state.completed[key]) state.completed[key] = [];
     if (state.completed[key].indexOf(id) === -1) state.completed[key].push(id);
@@ -431,7 +446,21 @@ const App = (function () {
       const d = Number(id.slice(2));
       state.owed = state.owed.filter(x => x !== d);
     }
-    return awardOnce('task:' + id, xp);
+    const task = taskById(id);
+    const cap = task ? task.xp : Math.max(0, targetXp || 0);
+    const day = dateKey();
+    if (!state.xpLog[day]) state.xpLog[day] = {};
+    const logKey = 'task:' + id;
+    const prev = state.xpLog[day][logKey] || 0;
+    const next = clamp(Math.max(prev, Math.round(targetXp || 0)), 0, cap);
+    const delta = next - prev;
+    if (delta > 0) { state.xpLog[day][logKey] = next; award(delta); }
+    return delta;
+  }
+  function awardTaskScore(id, correct, total) {
+    const task = taskById(id);
+    if (!task) return 0;
+    return completeTask(id, taskXpFor(task, correct, total));
   }
   function checkBadges() {
     BADGES.forEach(b => {
@@ -657,42 +686,69 @@ const App = (function () {
     return p ? clamp(p.rate, .6, 1.5) : (base || 1);
   }
 
+  // 优先挑设备里最像真人的语音：自然/神经音色 > 常见高质量音色 > 普通系统音
+  function voiceNaturalScore(v) {
+    const n = String(v.name || '').toLowerCase();
+    let s = 0;
+    if (/natural|neural|premium|enhanced/.test(n)) s += 100;
+    if (/aria|jenny|guy|sonia|ana|emma|brian|google|microsoft|samantha|daniel|karen|victoria|zira/.test(n)) s += 50;
+    if (/espeak|pico|compact|robot|sapi/.test(n)) s -= 100;
+    if (v.localService) s += 5;
+    return s;
+  }
+  function pickNaturalVoice(lang) {
+    const list = voiceList().filter(x => (lang && /^zh/i.test(lang)) ? /^zh/i.test(x.lang) : /^en/i.test(x.lang));
+    if (!list.length) return null;
+    return list.slice().sort((a, b) => voiceNaturalScore(b) - voiceNaturalScore(a))[0];
+  }
+  function speechPieces(text) {
+    const s = String(text || '').trim();
+    if (s.length <= 55 || !/[.!?。！？；;]/.test(s)) return [s];
+    const parts = s.split(/([.!?。！？；;])\s+/);
+    const out = [];
+    for (let i = 0; i < parts.length; i += 2) out.push((parts[i] || '') + (parts[i + 1] || ''));
+    return out.filter(Boolean);
+  }
   function speak(text, rate, opts) {
     opts = opts || {};
     if (!('speechSynthesis' in window)) { if (!opts.silent) toast('当前浏览器不支持语音朗读'); return null; }
     try {
       window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
       const key = opts.voiceURI || state.voiceURI;
       const st = VOICE_STYLES.find(s => s.key === key);
-      // 音色语音包：用识别出的音调/语速/性别套到系统语音上，中英文都生效
+      const natural = state.naturalVoice !== false && !opts.noNatural;
       const usingMine = key === 'style:mine' && !!state.voiceProfile;
-      const wantFemale = !opts.noStyle && st && st.key === 'style:gentle';
+      const isZh = !!(opts.lang && /^zh/i.test(opts.lang));
+      const pool = isZh ? voiceList().filter(x => /^zh/i.test(x.lang)) : englishVoices();
       let v = null;
-      if (opts.lang && /^zh/i.test(opts.lang)) {
-        const zhs = voiceList().filter(x => /^zh/i.test(x.lang));
-        if (usingMine) v = mineVoiceFor('zh-CN') || zhs[0] || null;
-        else v = (key && key !== 'none')
-          ? (zhs.find(x => x.voiceURI === key || x.name === key) || zhs[0] || null)
-          : (zhs[0] || null);
-        if (wantFemale && !usingMine && !(key && zhs.some(x => x.voiceURI === key || x.name === key))) v = femaleVoice(zhs) || v;
-        u.lang = v ? v.lang : 'zh-CN';
-      } else {
-        if (usingMine) v = mineVoiceFor('en-US') || englishVoices()[0] || null;
-        else v = key
-          ? (englishVoices().find(x => x.voiceURI === key || x.name === key) || null)
-          : chosenVoice();
-        if (wantFemale && !usingMine && !v) v = femaleVoice(englishVoices());
-        u.lang = v ? v.lang : 'en-US';
-      }
-      if (v) { try { u.voice = v; } catch (e) { /* 某些浏览器不接受外部语音对象，继续用 lang 朗读 */ } }
-      u.rate = (rate || state.rate || .85) * ((st && !opts.noStyle && st.rate) ? st.rate : 1) * (usingMine ? mineRate(1) : 1);
-      u.pitch = usingMine ? minePitch(1) : ((st && !opts.noStyle) ? st.pitch : 1);
-      u.volume = usingMine ? state.voiceProfile.volume : 1;
-      if (opts.onend) u.onend = opts.onend;
-      if (opts.onerror) u.onerror = opts.onerror;
-      window.speechSynthesis.speak(u);
-      return u;
+      if (usingMine) v = mineVoiceFor(isZh ? 'zh-CN' : 'en-US') || pool[0] || null;
+      else if (key && key !== 'none' && !st) v = pool.find(x => x.voiceURI === key || x.name === key) || null;
+      else if (natural) v = pickNaturalVoice(isZh ? 'zh-CN' : 'en-US');
+      else if (key === 'none') v = null;
+      else v = chosenVoice() || pool[0] || null;
+      if (!v && key === 'none' && !natural && isZh) v = femaleVoice(pool);
+      const pieces = natural && !opts.noSplit ? speechPieces(text) : [String(text || '')];
+      let firstU = null, i = 0;
+      const make = (piece) => {
+        const u = new SpeechSynthesisUtterance(piece);
+        if (v) { try { u.voice = v; } catch (e) {} }
+        u.lang = v ? v.lang : (isZh ? 'zh-CN' : 'en-US');
+        const baseRate = natural ? clamp(rate || state.rate || .95, .75, 1.15) : ((rate || state.rate || .85) * ((st && !opts.noStyle && st.rate) ? st.rate : 1));
+        u.rate = usingMine ? mineRate(baseRate) : baseRate;
+        u.pitch = usingMine ? minePitch(1) : (natural ? 1 : ((st && !opts.noStyle) ? st.pitch : 1));
+        u.volume = usingMine ? state.voiceProfile.volume : 1;
+        return u;
+      };
+      const next = () => {
+        if (i >= pieces.length) { if (opts.onend) opts.onend(); return; }
+        const u = make(pieces[i++]);
+        if (!firstU) firstU = u;
+        u.onend = () => setTimeout(next, natural ? 110 : 40);
+        u.onerror = (e) => { if (opts.onerror) opts.onerror(e); };
+        window.speechSynthesis.speak(u);
+      };
+      next();
+      return firstU;
     } catch (e) { if (!opts.silent) toast('语音播放失败，请检查系统语音包'); return null; }
   }
   function speakZh(text, opts) {
@@ -896,9 +952,10 @@ const App = (function () {
   /* ---------- 渲染各页面 ---------- */
   function updateHeader() {
     const li = levelInfo();
-    $('#topStreak').textContent = state.streak || 0;
-    $('#topXp').textContent = state.xp || 0;
-    $('#topLevel').textContent = 'Lv.' + li.level;
+    const streakEl = $('#topStreak'), xpEl = $('#topXp'), lvEl = $('#topLevel');
+    if (streakEl) streakEl.textContent = state.streak || 0;
+    if (xpEl) xpEl.textContent = state.xp || 0;
+    if (lvEl) lvEl.textContent = 'Lv.' + li.level;
   }
   function renderHome() {
     const el = $('#view-home');
@@ -928,18 +985,18 @@ const App = (function () {
       '<div class="section-title"><h2>📊 我的战绩</h2><span class="hint">每天进步一点点</span></div>' +
       '<div class="stats-grid">' +
         statCard('🔥', state.streak, '连续学习(天)') +
-        statCard('📖', words, '已掌握单词') +
+        '<button class="stat-card stat-link" data-action="goArchive" title="点击查看学习档案"><div class="ic">📖</div><b>' + words + '</b><span>已掌握单词 →</span></button>' +
         statCard('⭐', state.xp, '总经验值') +
         statCard('🎓', 'Lv.' + li.level, '当前等级') +
       '</div>' +
 
-      '<div class="section-title"><h2>📋 今日学习计划</h2><span class="hint">' + doneCount + '/' + tasks.length + ' 已完成 · 预计 ' + state.minutes + ' 分钟</span></div>' +
+      '<div class="section-title"><h2>📋 今日学习计划</h2><span class="hint">' + doneCount + '/' + tasks.length + ' 已完成 · 积分按答对题数发放</span></div>' +
       '<div class="task-list">' + tasks.map(t => {
         const d = done.indexOf(t.id) !== -1;
         return '<div class="task-item' + (d ? ' done' : '') + '" data-task="' + t.id + '" data-mod="' + t.mod + '">' +
           '<div class="task-ic" style="background:' + (d ? '#E3F9F3' : '#F0EDFF') + '">' + t.icon + '</div>' +
           '<div class="task-info"><div class="task-name">' + t.name + '</div><div class="task-desc">' + esc(t.desc) + '</div></div>' +
-          '<span class="task-reward">+' + t.xp + ' XP</span><span class="task-status">' + (d ? '已完成 ✓' : '开始 →') + '</span></div>';
+          '<span class="task-reward">最高 +' + t.xp + ' XP</span><span class="task-status">' + (d ? '已完成 ✓' : '开始 →') + '</span></div>';
       }).join('') + '</div>' +
 
       '<div class="card" style="margin-top:16px"><div class="day-header">' +
@@ -970,9 +1027,18 @@ const App = (function () {
   }
   function renderLearn() {
     const mods = [
+      ['archive', '🗂️', '我的学习档案', '学过全汇总，随时查和复习', 'm-review'],
       ['write', '✍️', '手写练习板', '描红书写，记牢拼写', 'm-reading'],
-      ['dictation', '📝', '默写测验', '听音看义，手写自动判分', 'm-game'],
+      ['dictation', '📝', '默写测验', '今日单词，听音看义手写判分', 'm-game'],
+      ['dictationAll', '🎓', '四级词库默写', '4642 词随机抽题，自动判分', 'm-game'],
       ['dialogue', '💬', '口语对话', '按进度情景对话，开口说', 'm-speaking'],
+      ['cenListening', '🎧', '四级听力', '新闻/对话/讲座 · 5 题', 'm-listening'],
+      ['cenReading', '📚', '四级阅读', '选词填空/匹配/仔细阅读', 'm-reading'],
+      ['writing', '✍️', '四级写作', '12 话题 · 范文+词组', 'm-reading'],
+      ['translation', '🌏', '四级翻译', '12 篇汉译英 · 参考译文', 'm-reading'],
+      ['mockFull', '📝', '四级真题模考', '完整流程 · 分项评分', 'm-game'],
+      ['wrongBook', '📕', '四级错题本', '自动收集 · 集中攻克', 'm-review'],
+      ['translate', '🔁', '中英互译', '词句双向 · 可朗读', 'm-reading'],
       ['letter', '🔤', '字母音', '字母在词里发什么音', 'm-phonetic'],
       ['words', '📖', '单词卡片', '每天新词，翻卡记忆', 'm-words'],
       ['phonetic', '🔤', '音标启蒙', '44 个音标，发音无忧', 'm-phonetic'],
@@ -993,6 +1059,216 @@ const App = (function () {
       ).join('') + '</div>' +
       '<div class="card" style="margin-top:18px"><h3>💡 高效学习小贴士</h3><p class="muted">① 先听发音再记拼写，声音比文字更好记；② 每张卡片主动回忆后再翻开；③ 每天睡前用 3 分钟复盘当天单词；④ 不要怕犯错，错题记得越牢。</p></div>';
   }
+  /* ---------- 我的学习档案：按已学天数汇总单词/音标/字母/拼读/语法/句子 ---------- */
+  let archiveState = { cat: 'w', q: '', scope: 'learned' };
+  let exportSelection = { w:true, p:true, l:true, b:true, g:true, s:true, scope:'learned' };
+  function courseDaysLearned() {
+    // 已学"课程日"数，映射到源课程日（1..SOURCE_DAYS）
+    const day = state.dayIndex || 1;
+    const out = [];
+    for (let d = 1; d <= day; d++) out.push(courseDay(d));
+    return out;
+  }
+  function collectArchive() {
+    const seen = { w:{}, p:{}, l:{}, b:{}, g:{}, s:{} };
+    const data = { w:[], p:[], l:[], b:[], g:[], s:[] };
+    function add(cat, key, item) {
+      if (seen[cat][key]) return;
+      seen[cat][key] = true;
+      data[cat].push(item);
+    }
+    // 遍历已学的每个课程日，从固定课程表收集
+    courseDaysLearned().forEach(c0 => {
+      const c = effectiveCourseDay(c0);
+      // 任务一：字母 / 音标 / 拼读 / 语法
+      if (c <= 6) {
+        const groups = [[0,1,2,3,4],[5,6,7,8,9],[10,11,12,13,14],[15,16,17,18,19],[20,21,22,23,24,25],[0,4,8,12,16,20,24]];
+        (groups[c-1]||[]).forEach(i => { const L = LETTERS[i]; if (L) add('l', 'L'+i, { key:'L'+i, main:L.letter, sub:'字母音 '+L.sound+' · 例词 '+L.soundEx+' '+L.soundCn, ph:L.sound, cn:L.soundCn, audio:L.soundEx, tip:L.tip, day:c, kind:'字母音' }); });
+      } else if (c <= 28) {
+        const from = (c-7)*2;
+        [from, from+1].forEach(i => { const P = PHONETICS[i]; if (P) add('p', 'P'+i, { key:'P'+i, main:P.sym, sub:P.type+' · 例词 '+P.ex+' '+P.cn, ph:P.sym, cn:P.cn, audio:P.ex, day:c, kind:'音标' }); });
+      } else if (c <= 44) {
+        const base = (c-29)*3;
+        [base%44,(base+1)%44,(base+2)%44].forEach(i => { const P = PHONETICS[i]; if (P) add('p', 'P'+i, { key:'P'+i, main:P.sym, sub:P.type+' · 例词 '+P.ex+' '+P.cn, ph:P.sym, cn:P.cn, audio:P.ex, day:c, kind:'音标' }); });
+      } else if (c <= 90) {
+        const start = ((c-45)*2) % BLEND_LESSONS.length;
+        [start,(start+1)%BLEND_LESSONS.length].forEach(i => { const B = BLEND_LESSONS[i%BLEND_LESSONS.length]; if (B) add('b', 'B'+i, { key:'B'+i, main:B.word, sub:'拼读 '+B.parts.join(' + ')+' → '+B.cn, ph:B.parts.map(x=>'/'+x+'/').join(' '), cn:B.cn, audio:B.word, day:c, kind:'自然拼读' }); });
+      } else {
+        const gi = (c-91) % GRAMMAR.length;
+        const G = GRAMMAR[gi];
+        if (G) add('g', 'G'+gi, { key:'G'+gi, main:G.title, sub:G.point, ex:G.ex, cn:G.cn, audio:G.ex, day:c, kind:'语法' });
+      }
+      // 任务二：每日单词
+      let wSrc, wCount, wStart;
+      if (c <= 44) { wSrc = EASY_WORDS; wCount = dailyWordCount(4); wStart = ((c-1)*4) % Math.max(1, EASY_WORDS.length-wCount); }
+      else if (c <= 90) { wSrc = ALL_WORDS; wCount = dailyWordCount(6); wStart = 55 + ((c-45)*6) % Math.max(1, ALL_WORDS.length-55-wCount); }
+      else { wSrc = ALL_WORDS; wCount = dailyWordCount(10); wStart = ((c-91)*10) % Math.max(1, ALL_WORDS.length-wCount); }
+      wSrc.slice(wStart, wStart+wCount).forEach(w => { if (w && w.w) add('w', w.w, { key:w.w, main:w.w, sub:w.ex || '', ph:w.ph || '', cn:w.cn || '', cnEx:w.cnEx || '', audio:w.w, day:c, kind:'单词' }); });
+      // 任务三：听力句子 / 口语话题 / 阅读短文
+      if (c > 90) {
+        const mode = (c-1)%4;
+        if (mode === 0 || mode === 3) {
+          const li = (mode===0 ? (c*2) : (c*3)) % LISTEN_BANK.length;
+          [li,(li+7)%LISTEN_BANK.length].forEach(i => { const S = LISTEN_BANK[i]; if (S) add('s', 'S'+i, { key:'S'+i, main:S[0], sub:'听力句型', cn:S[1], audio:S[0], day:c, kind:'句子' }); });
+        } else if (mode === 1) {
+          const ph = phaseOf(c);
+          const pool = PASSAGES.filter(x => x.lvl <= Math.min(4, ph.id));
+          const pi = c % Math.max(1,pool.length);
+          const P = pool[pi];
+          if (P) add('s', 'P'+P.title, { key:'P'+P.title, main:P.text, sub:'短文《'+P.title+'》', cn:P.cn, audio:P.text, day:c, kind:'短文' });
+        } else if (mode === 2) {
+          const ti = (c-1) % SPEAK_TOPICS.length;
+          const T = SPEAK_TOPICS[ti];
+          if (T) add('s', 'T'+ti, { key:'T'+ti, main:T.sample, sub:'口语：'+T.q, cn:T.cn, audio:T.sample, day:c, kind:'口语句' });
+        }
+      }
+    });
+    // 补充：口语对话场景（按已解锁档位的全部句子）
+    const tier = dialogueTier();
+    const tiers = tier === 'fluent' ? ['starter','builder','fluent'] : (tier === 'builder' ? ['starter','builder'] : ['starter']);
+    tiers.forEach(t => (DIALOGUE_SCENES[t]||[]).forEach(sc => (sc.turns||[]).forEach((turn,i) => {
+      add('s', 'D'+t+sc.id+i, { key:'D'+t+sc.id+i, main:turn.sample, sub:'对话《'+sc.title+'》', cn:turn.sampleCn||'', audio:turn.sample, day:0, kind:'对话句' });
+      add('s', 'DQ'+t+sc.id+i, { key:'DQ'+t+sc.id+i, main:turn.sys, sub:'对话《'+sc.title+'》· 系统问句', cn:turn.cn||'', audio:turn.sys, day:0, kind:'对话句' });
+    })));
+    // 补充：已实际学过但可能不在课程表推导里的单词（learnedWords）
+    Object.keys(state.learnedWords||{}).forEach(w => {
+      if (seen.w[w]) return;
+      let info = null;
+      for (const arr of [EASY_WORDS, ALL_WORDS]) { const f = arr.find(x => x.w === w); if (f) { info = f; break; } }
+      const rec = state.learnedWords[w] || {};
+      add('w', w, { key:w, main:w, sub:info && info.ex || '', ph:info && info.ph || '', cn:info && info.cn || '', cnEx:info && info.cnEx || '', audio:w, day:0, kind:'单词', learned:rec.t });
+    });
+    return data;
+  }
+  function xmlCell(v) {
+    const s = String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+    return '<Cell><Data ss:Type="String">' + s + '</Data></Cell>';
+  }
+  const EXPORT_CATS = [
+    ['w','📖','单词','words'], ['p','🔤','音标','phonetics'], ['l','🔤','字母音','letters'],
+    ['b','🧩','自然拼读','blends'], ['g','🧩','语法','grammar'], ['s','💬','句子','sentences']
+  ];
+  function archiveCats() { return EXPORT_CATS.map(c => ({ id:c[0], icon:c[1], name:c[2] })); }
+  // 选择导出哪些类别：每类显示实际条数与内容示例，勾选后才导出
+  function openExportDialog() {
+    const data = collectArchive();
+    const sel = exportSelection;
+    const counts = { w:data.w.length, p:data.p.length, l:data.l.length, b:data.b.length, g:data.g.length, s:data.s.length };
+    const sample = c => {
+      const x = (data[c]||[])[0];
+      if (!x) return '暂无记录';
+      return (x.main||'') + (x.ph ? ' ' + x.ph : '') + (x.cn ? ' · ' + x.cn : '');
+    };
+    openModal(modalHead('📊 导出学习内容') +
+      '<div class="reward-banner">勾选要导出的类别，表格里是<b>完整学习内容</b>（不是数量统计）。可多选，一次导出为一个 Excel 文件。</div>' +
+      '<div class="exp-list">' + EXPORT_CATS.map(c => {
+        const on = sel[c[0]];
+        return '<label class="exp-item' + (on ? ' on' : '') + '">' +
+          '<input type="checkbox" data-exp-cat="' + c[0] + '"' + (on ? ' checked' : '') + '>' +
+          '<span class="exp-ic">' + c[1] + '</span>' +
+          '<span class="exp-body"><b>' + c[2] + '</b><small>' + sample(c[0]) + '</small></span>' +
+          '<span class="exp-count">' + counts[c[0]] + ' 条</span></label>';
+      }).join('') + '</div>' +
+      '<div class="exp-scope"><span>单词范围</span>' +
+        '<button class="arch-tab' + (sel.scope==='learned' ? ' active' : '') + '" data-action="expScope" data-scope="learned">已学单词</button>' +
+        '<button class="arch-tab' + (sel.scope==='all' ? ' active' : '') + '" data-action="expScope" data-scope="all">完整四级词库 ' + ALL_WORDS.length + ' 词</button></div>' +
+      '<div class="exp-actions"><button class="btn sm" data-action="expAll">全选</button><button class="btn sm" data-action="expNone">全不选</button></div>' +
+      '<button class="btn primary big" data-action="expDo">导出所选内容 →</button>');
+  }
+  // 生成工作表：内容表在前、说明表在最后，每张表含完整字段而非只有数量
+  function buildExportSheets(chosen, data, sel) {
+    const build = {
+      w: () => ({ name:'单词', rows:[['序号','单词','音标','中文释义','例句','例句中文','学习天数','来源']].concat(data.w.map((x,i) => [i+1, x.main, x.ph, x.cn, x.sub, x.cnEx, x.day||'', x.kind||''])) }),
+      p: () => ({ name:'音标', rows:[['序号','音标','类型/说明','中文','例词','学习天数','来源']].concat(data.p.map((x,i) => [i+1, x.main, x.sub, x.cn, x.audio, x.day||'', x.kind||''])) }),
+      l: () => ({ name:'字母音', rows:[['序号','字母','字母音','例词','中文','提示','学习天数']].concat(data.l.map((x,i) => [i+1, x.main, x.ph, x.audio, x.cn, x.sub, x.day||''])) }),
+      b: () => ({ name:'自然拼读', rows:[['序号','单词','拼读拆分','中文','学习天数']].concat(data.b.map((x,i) => [i+1, x.main, x.ph, x.cn, x.day||''])) }),
+      g: () => ({ name:'语法', rows:[['序号','语法点','要点','例句','中文','学习天数']].concat(data.g.map((x,i) => [i+1, x.main, x.sub, x.ex, x.cn, x.day||''])) }),
+      s: () => ({ name:'句子', rows:[['序号','句子','说明','中文','学习天数','来源']].concat(data.s.map((x,i) => [i+1, x.main, x.sub, x.cn, x.day||'', x.kind||''])) })
+    };
+    // 内容表在前，说明表在最后；每张表第一行就是完整内容
+    const sheets = chosen.map(c => build[c[0]]());
+    sheets.push({ name:'导出说明', rows:[['项目','内容'],
+      ['导出日期', dateKey()], ['英语启航','EnglishQuest'],
+      ['导出类别', chosen.map(c => c[2]).join('、')],
+      ['各类条数', chosen.map(c => c[2] + ' ' + data[c[0]].length + ' 条').join('；')],
+      ['单词范围', (sel.w && sel.scope==='all') ? '完整四级词库' : '已学单词'],
+      ['提示','每个类别一个工作表，含完整内容与例句；可用 Excel/WPS 直接打开'] ] });
+    return sheets;
+  }
+  function exportArchiveExcel() {
+    const sel = exportSelection;
+    const chosen = EXPORT_CATS.filter(c => sel[c[0]]);
+    if (!chosen.length) { toast('请至少勾选一个要导出的类别'); return; }
+    const data = collectArchive();
+    // 单词可选导出完整四级词库
+    if (sel.w && sel.scope === 'all') {
+      data.w = ALL_WORDS.map(w => ({ main:w.w, ph:w.ph||'', cn:w.cn||'', sub:w.ex||'', cnEx:w.cnEx||'', day:0, kind:'四级词库' }));
+    }
+    const sheets = buildExportSheets(chosen, data, sel);
+    const xml = '<?xml version="1.0" encoding="UTF-8"?><?mso-application progid="Excel.Sheet"?>' +
+      '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">' +
+      sheets.map(sh => '<Worksheet ss:Name="' + String(sh.name).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;') + '"><Table>' +
+        sh.rows.map(row => '<Row>' + row.map(xmlCell).join('') + '</Row>').join('') +
+        '</Table></Worksheet>').join('') + '</Workbook>';
+    const blob = new Blob(['\ufeff' + xml], { type:'application/vnd.ms-excel;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '英语启航-' + chosen.map(c => c[0]).join('') + '-' + dateKey() + '.xls';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    closeModal();
+    toast('📊 已导出 ' + chosen.length + ' 类学习内容：' + chosen.map(c => c[2]).join('、'));
+  }
+  function renderArchive() {
+    const el = $('#view-archive');
+    if (!el) return;
+    const data = collectArchive();
+    const cats = [
+      ['w','📖','单词','words'], ['p','🔤','音标','phonetics'], ['l','🔤','字母音','letters'],
+      ['b','🧩','自然拼读','blends'], ['g','🧩','语法','grammar'], ['s','💬','句子','sentences']
+    ];
+    const q = (archiveState.q||'').trim().toLowerCase();
+    let list = data[archiveState.cat] || [];
+    const allScope = archiveState.scope === 'all';
+    if (allScope && archiveState.cat === 'w') {
+      list = ALL_WORDS.map(w => ({ key:w.w, main:w.w, sub:w.ex || '', ph:w.ph || '', cn:w.cn || '', cnEx:w.cnEx || '', audio:w.w, day:0, kind:'四级词库' }));
+    }
+    if (q) list = list.filter(x => (x.main+' '+(x.cn||'')+' '+(x.ph||'')+' '+(x.sub||'')).toLowerCase().indexOf(q) !== -1);
+    el.innerHTML =
+      '<div class="section-title" style="margin-top:4px"><h2>🗂️ 我的学习档案</h2><div style="display:flex;gap:8px"><button class="btn sm" data-action="archExport">📊 导出学习内容</button><button class="arch-back" data-action="archBack">← 返回学习</button></div></div>' +
+      '<div class="timeline-note" style="margin-bottom:12px"><span style="font-size:20px">📚</span><div>' + (allScope ? '当前展示<b>完整四级词库 ' + ALL_WORDS.length + ' 词</b>，可点 🔊 听读音、搜索中文或英文；切回「已学」只看自己学过的内容。' : '这里汇总了从第 1 天到<b>第 ' + (state.dayIndex||1) + ' 天</b>你学过的所有内容：单词、音标、字母音、拼读、语法和句子。点 🔊 随时听，点「再练」重新复习。') + '</div></div>' +
+      '<div style="margin-bottom:10px"><button class="arch-tab active" data-action="archScope">' + (allScope ? '👀 只看已学' : '📚 查看完整四级词库（' + ALL_WORDS.length + ' 词）') + '</button></div>' +
+      '<div class="arch-tabs">' + cats.map(c => '<button class="arch-tab' + (archiveState.cat===c[0] ? ' active' : '') + '" data-action="archTab" data-cat="' + c[0] + '">' + c[1] + ' ' + c[2] + '<span class="arch-num">' + (allScope && c[0]==='w' ? ALL_WORDS.length : (data[c[0]]||[]).length) + '</span></button>').join('') + '</div>' +
+      '<div class="arch-search"><input id="archSearch" type="search" placeholder="🔍 搜索' + (cats.find(c=>c[0]===archiveState.cat)||[])[2] + '（英文或中文）" value="' + esc(archiveState.q||'') + '"></div>' +
+      '<div class="arch-meta">共 ' + list.length + (q ? ' 条结果' : ' 条记录') + '</div>' +
+      '<div class="arch-list">' + (list.length ? list.map((x,i) =>
+        '<div class="arch-item"><div class="arch-row">' +
+          '<div class="arch-main">' + esc(x.main) + '</div>' +
+          '<button class="arch-play" data-action="archSpeak" data-key="' + x.key + '">🔊</button>' +
+        '</div>' +
+        (x.ph ? '<div class="arch-ph">' + esc(x.ph) + '</div>' : '') +
+        (x.cn ? '<div class="arch-cn">' + esc(x.cn) + '</div>' : '') +
+        (x.cnEx ? '<div class="arch-sub">例：' + esc(x.cnEx) + '</div>' : '') +
+        (x.sub ? '<div class="arch-sub">' + esc(x.sub) + '</div>' : '') +
+        '<div class="arch-foot"><span class="badge purple">' + esc(x.kind) + '</span>' + (x.day ? '<span class="muted">第 ' + x.day + ' 天</span>' : '') + '</div>' +
+        '</div>').join('') : '<div class="card center muted" style="padding:24px">没有找到相关内容。换个关键词试试，或先去完成几天课程。</div>') + '</div>';
+    // 搜索框事件（每次渲染重新绑定）
+    const input = $('#archSearch');
+    if (input) input.addEventListener('input', e => {
+      archiveState.q = e.target.value;
+      clearTimeout(archiveState.timer);
+      archiveState.timer = setTimeout(() => { renderArchive(); const n = $('#archSearch'); if (n) { n.focus(); n.setSelectionRange(n.value.length,n.value.length); } }, 180);
+    });
+  }
+  function archiveFind(key) {
+    const data = collectArchive();
+    for (const cat of Object.keys(data)) { const f = data[cat].find(x => x.key === key); if (f) return f; }
+    const w = ALL_WORDS.find(x => x.w === key);
+    return w ? { key:w.w, main:w.w, ph:w.ph, cn:w.cn, audio:w.w } : null;
+  }
+  function goArchive() { renderArchive(); go('archive'); }
+
   function renderPlan() {
     const day = state.dayIndex;
     const total = totalDays();
@@ -1021,12 +1297,12 @@ const App = (function () {
         ? '第 1–6 天：字母音（跳过已会的字母名）+ 4 个高频词 + 听音辨字母；第 8–30 天：每天 2 个音标 + 4 个词 + 听音辨音标；第 31–48 天：音标巩固 + 4 个词 + 听音辨音标；第 49–83 天：自然拼读 + 6 个词 + 听词选义。第 84 天起才进入语法与整句听力。'
         : p.id === 2
           ? '每天固定：语法 1 讲（24 讲循环）+ 单词 10 个 + 听力/阅读/口语/听力加练四天一循环 + 复习或游戏隔天交替。'
-          : '每天固定：语法 1 讲 + 单词 10 个 + 听力/阅读/口语/四级模考四天一循环 + 复习或游戏隔天交替。';
+          : '每天固定：语法 1 讲 + 单词 10 个 + 四级听力 / 仔细阅读 / 写作 / 翻译 / 口语 / 真题模考六天一循环 + 复习或游戏隔天交替。';
       return '<div class="card" style="margin-bottom:10px;box-shadow:none"><b>第 ' + p.id + ' 阶段 · ' + p.name + '（第 ' + realDayOf(p.days[0]) + '–' + realDayOf(p.days[1]) + ' 天）</b><p class="muted" style="margin:6px 0 0">' + tpl + '</p></div>';
     }).join('');
     $('#view-plan').innerHTML =
-      '<div class="section-title" style="margin-top:4px"><h2>🗺️ ' + (total === 730 ? '两年' : '约 ' + Math.round(total / 30.44) + ' 个月') + '通关路线图</h2><span class="hint">零基础 → 英语四级</span></div>' +
-      '<div class="timeline-note"><span style="font-size:22px">🎓</span><div><b>目标：' + total + ' 天后通过大学英语四级（CET-4）</b><br>词汇量从 0 累积到 3500+，分四个阶段循序渐进。每天只需 ' + state.minutes + ' 分钟，坚持就是胜利！</div></div>' +
+      '<div class="section-title" style="margin-top:4px"><h2>🗺️ ' + (total === 730 ? '两年' : '约 ' + Math.round(total / 30.44) + ' 个月') + '通关路线图</h2><span class="hint">只认识字母 → 英语四级</span></div>' +
+      '<div class="timeline-note"><span style="font-size:22px">🎓</span><div><b>目标：' + total + ' 天后通过大学英语四级（CET-4）</b><br>按你现在的情况固定安排：你会认字母，就从<b>字母在单词里的发音</b>开始，接着音标 → 自然拼读 → 语法句子 → 四级题型，不跳过任何一步。词汇量累积到 4642 词完整词库，分四个阶段循序渐进。每天 ' + state.minutes + ' 分钟，坚持就是胜利！</div></div>' +
       '<div class="card" style="margin-bottom:16px"><div class="progress-meta" style="color:var(--sub)"><span>当前进度</span><span>第 ' + day + ' 天 / ' + total + ' 天</span></div><div class="progress"><i style="width:' + clamp(day / total * 100, 0, 100) + '%"></i></div></div>' +
       phases +
       '<div class="section-title"><h2>📅 每天固定做什么</h2><span class="hint">按顺序做，不用自己挑</span></div>' +
@@ -1081,7 +1357,19 @@ const App = (function () {
         row('累计断签天数', (state.misses || 0) + ' 天') +
         row('当前欠账补做', (state.owed || []).length + ' 天') +
       '</div>' +
+      '<div class="card"><h3>🎯 学习画像</h3>' +
+        '<div class="info-row"><span class="label">当前水平</span><span class="value">只认识字母（按你的情况固定，无需选择）</span></div>' +
+        '<div class="info-row"><span class="label">起步内容</span><span class="value">字母音 → 音标 → 自然拼读 → 语法 → 四级题型</span></div>' +
+        '<div class="info-row"><span class="label">目标</span><span class="value">大学英语四级 CET-4 · 4642 词完整词库</span></div>' +
+        '<div class="info-row"><span class="label">每日安排</span><span class="value">' + state.minutes + ' 分钟 · 4 项固定任务 + 到期复习</span></div>' +
+        '<p class="muted" style="font-size:11px">计划已按你「只认识字母、不认识音标/单词/语法/句子」的真实情况固定，不需要也不提供中学/大学基础切换；修改下方时长后保存，只会按每日时间微调单词量。</p></div>' +
       '<div class="card"><h3>🔊 调整设置</h3>' +
+        '<label class="onboard-label">学习目标</label><select id="setTarget" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
+          '<option value="cet4"' + (state.target === 'cet4' ? ' selected' : '') + '>大学英语四级 CET-4（4642 词完整词库）</option></select>' +
+        '<label class="onboard-label">人声自然度（推荐开启）</label><select id="setNaturalVoice" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
+          '<option value="1"' + (state.naturalVoice !== false ? ' selected' : '') + '>开启：优先真人/神经语音，按句意自然停顿</option>' +
+          '<option value="0"' + (state.naturalVoice === false ? ' selected' : '') + '>关闭：使用风格化语音（变声效果）</option></select>' +
+        '<div style="margin:8px 0"><button class="btn sm" data-action="tryNatural">🔊 试听自然语音</button></div>' +
         '<label class="onboard-label">开始日期（修改后重新计算计划）</label><input type="date" id="setStart" value="' + esc(state.startDate || '') + '" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
         '<label class="onboard-label">计划总周期</label><select id="setTargetDays" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
           [[730, '730 天（两年）'], [670, '670 天（22 个月）'], [365, '365 天（一年）']].map(d => '<option value="' + d[0] + '"' + (d[0] === totalDays() ? ' selected' : '') + '>' + d[1] + '</option>').join('') + '</select>' +
@@ -1195,12 +1483,12 @@ const App = (function () {
 
   /* ---------- 练习引擎 ---------- */
   function startExercise(type, taskId, cfg) {
-    ex = { type, taskId, cfg: cfg || {}, step: 0, correct: 0, locked: false };
+    ex = { type, taskId, cfg: cfg || {}, step: 0, correct: 0, total: 0, locked: false, readingDone: {} };
     const phase = phaseOf();
     const C = ex.cfg;
     const seed = C.seed || ((state.dayIndex || 1) * 100 + (taskId ? taskId.charCodeAt(0) : 0));
     if (type === 'letter') {
-      ex.cards = C.idx ? C.idx.map(i => LETTERS[i]) : [LETTERS[(state.dayIndex - 1) % 26]];
+      ex.cards = C.idx ? C.idx.map(i => LETTERS[i]) : [LETTERS[(Math.max(1, state.dayIndex || 1) - 1) % 26]];
       renderLetter();
     } else if (type === 'blend') {
       ex.cards = C.idx ? C.idx.map(i => BLEND_LESSONS[i % BLEND_LESSONS.length]) : pick(BLEND_LESSONS, 3);
@@ -1242,7 +1530,7 @@ const App = (function () {
       const gsrc = C.src === 'easy' ? EASY_WORDS : ALL_WORDS;
       ex.pairs = C.start != null ? gsrc.slice(C.start, C.start + C.count) : pick(wordPool().filter(w => w.cn && w.w.length < 12), 5);
       ex.left = seededShuffle(ex.pairs, seed); ex.right = seededShuffle(ex.pairs, seed + 7);
-      ex.selected = null; ex.matched = [];
+      ex.selected = null; ex.matched = []; ex.total = ex.pairs.length;
       renderGame();
     } else if (type === 'review') {
       const pool = C.src === 'easy' ? EASY_WORDS : ALL_WORDS;
@@ -1258,6 +1546,27 @@ const App = (function () {
     } else if (type === 'mock') {
       ex.questions = makeMockQuestions(10, seed);
       renderQuiz('📝 四级综合模考', '10 道题，检验你的学习成果');
+    } else if (type === 'cenListening') {
+      ex.questions = makeCET4ListeningQuestions(5, seed);
+      renderQuiz('🎧 四级听力训练', '新闻 / 对话 / 讲座 · 听后选择答案');
+    } else if (type === 'cenReading') {
+      const kind = C.kind || 'careful';
+      if (kind === 'cloze') {
+        ex.questions = makeClozeQuestions(CET4_CLOZE[seed % CET4_CLOZE.length]);
+        renderQuiz('📚 选词填空', '根据上下文，为空格选择合适的词');
+      } else if (kind === 'matching') {
+        ex.questions = makeMatchingQuestions(CET4_MATCHING[seed % CET4_MATCHING.length]);
+        renderQuiz('📚 长篇阅读匹配', '判断每个陈述对应哪一段');
+      } else {
+        ex.questions = makeCarefulQuestions(CET4_CAREFUL[seed % CET4_CAREFUL.length]);
+        renderQuiz('📚 仔细阅读', '阅读短文并回答问题');
+      }
+    } else if (type === 'writing') {
+      openWriting(C.id, taskId);
+    } else if (type === 'translation') {
+      openTranslationExercise(C.id, taskId);
+    } else if (type === 'mockFull') {
+      openFullMock(taskId);
     }
   }
   function makeWordQuestions(pool, n, seed) {
@@ -1351,11 +1660,38 @@ const App = (function () {
     const gram = seededShuffle(GRAMMAR, S + 9).slice(0, Math.floor(n / 2)).map(g => ({ q: g.q, opts: g.opts, ans: g.ans, why: g.why }));
     return seededShuffle(vocab.concat(gram), S + 17).slice(0, n);
   }
+  function makeCET4ListeningQuestions(n, seed) {
+    const S = seed || Date.now();
+    return seededShuffle(CET4_LISTENING, S).slice(0, n).map(x => ({
+      id:'L:'+x.id, q:x.q, audio:x.audio, opts:x.opts, ans:x.ans, why:x.why, type:'四级听力'
+    }));
+  }
+  function makeClozeQuestions(item) {
+    if (!item) return [];
+    return item.ans.map((a, i) => {
+      const right = item.bank[a];
+      const wrong = seededShuffle(item.bank.filter((_, j) => j !== a), 7 + i).slice(0, 3);
+      const opts = seededShuffle([right].concat(wrong), 13 + i);
+      return { id:'C:'+item.id+':'+i, q:'第 ' + (i+1) + ' 空：' + item.text.replace(new RegExp('__' + (i+1) + '__'), '______'), opts, ans:opts.indexOf(right), why:(item.why && item.why[i]) || '', type:'选词填空' };
+    });
+  }
+  function makeMatchingQuestions(item) {
+    if (!item) return [];
+    return item.ans.map((a, i) => ({
+      id:'M:'+item.id+':'+i, q:'陈述：' + item.statements[i] + '\n它对应哪一段？',
+      opts:item.paras.map(p => p.slice(0, 1)), ans:a, why:item.why && item.why[i] || '', type:'长篇阅读'
+    }));
+  }
+  function makeCarefulQuestions(item) {
+    if (!item) return [];
+    return item.qs.map((q, i) => ({ id:'R:'+item.id+':'+i, q:'《'+item.title+'》'+q.q, opts:q.opts, ans:q.ans, why:q.why, type:'仔细阅读' }));
+  }
   function dots() {
     if (!ex.questions) return '';
     return '<div class="progress-dots">' + ex.questions.map((_, i) => '<i class="' + (i <= ex.step ? 'on' : '') + '"></i>').join('') + '</div>';
   }
   function renderQuiz(title, subtitle) {
+    ex.total = ex.questions.length;
     const q = ex.questions[ex.step];
     openModal(modalHead(title) +
       '<p class="muted">' + subtitle + ' · 第 ' + (ex.step + 1) + '/' + ex.questions.length + ' 题</p>' +
@@ -1383,6 +1719,11 @@ const App = (function () {
         }
       }
     }
+    if (!right && q.id) {
+      state.wrongBook[q.id] = { id:q.id, type:q.type || '练习', q:q.q, audio:q.audio || '', opts:q.opts, ans:q.ans, why:q.why || '', t:dateKey(), count:(state.wrongBook[q.id] ? state.wrongBook[q.id].count || 0 : 0) + 1 };
+      saveState();
+    }
+    if (right && ex.type === 'wrongBook' && q.id) { delete state.wrongBook[q.id]; saveState(); }
     $$('.opt').forEach((b, idx) => {
       b.classList.add('disabled');
       if (idx === q.ans) b.classList.add('right');
@@ -1421,7 +1762,7 @@ const App = (function () {
     saveState();
     ex.step++;
     if (ex.step >= ex.cards.length) {
-      ex.questions = makeWordQuestions(ex.cards, Math.min(3, ex.cards.length));
+      ex.questions = makeWordQuestions(ex.cards, ex.cards.length);
       ex.step = 0; ex.cards = null;
       renderQuiz('🧠 小测验', '刚记的单词，考考你');
     } else renderCard();
@@ -1479,6 +1820,30 @@ const App = (function () {
       '<button class="btn primary big" data-action="nextPhonetic">' + (ex.step === ex.cards.length - 1 ? '学会了，完成 →' : '下一个 →') + '</button>');
     speak(b.word);
   }
+  function makeLetterSoundQuestions(cards, seed) {
+    const S = seed || Date.now();
+    return cards.map((L, i) => {
+      const wrong = seededShuffle(LETTERS.filter(x => x.sound !== L.sound), S + i).slice(0, 3).map(x => x.sound);
+      const opts = seededShuffle([L.sound].concat(wrong), S + i + 51);
+      return { q: '字母 ' + L.letter + ' 在单词里发什么音？', opts, ans: opts.indexOf(L.sound), why: L.hint, audio: L.soundEx, type: '字母音' };
+    });
+  }
+  function makePhoneticCardQuestions(cards, seed) {
+    const S = seed || Date.now();
+    return cards.map((p, i) => {
+      const wrong = seededShuffle(PHONETICS.filter(x => x.sym !== p.sym), S + i).slice(0, 3).map(x => x.ex);
+      const opts = seededShuffle([p.ex].concat(wrong), S + i + 51);
+      return { q: '音标 ' + p.sym + ' 的例词是？', opts, ans: opts.indexOf(p.ex), why: p.sym + ' = ' + p.ex + ' ' + p.cn, audio: p.ex, type: '音标' };
+    });
+  }
+  function makeBlendQuestions(cards, seed) {
+    const S = seed || Date.now();
+    return cards.map((b, i) => {
+      const wrong = seededShuffle(BLEND_LESSONS.filter(x => x.word !== b.word), S + i).slice(0, 3).map(x => x.word);
+      const opts = seededShuffle([b.word].concat(wrong), S + i + 51);
+      return { q: '拼读 ' + b.parts.join(' + ') + ' → 哪个单词？', opts, ans: opts.indexOf(b.word), why: b.parts.join('+') + ' = ' + b.word + ' ' + b.cn, audio: b.word, type: '自然拼读' };
+    });
+  }
   function nextPhonetic() {
     ex.step++;
     if (ex.step >= ex.cards.length) {
@@ -1489,12 +1854,18 @@ const App = (function () {
       if (ex.type === 'blend' && ex.cfg.idx) {
         ex.cfg.idx.forEach(i => scheduleItem('w', BLEND_LESSONS[i % BLEND_LESSONS.length].word, dateKey()));
       }
-      finishExercise();
+      const seed = (state.dayIndex || 1) * 100 + (ex.taskId ? ex.taskId.charCodeAt(0) : 0);
+      if (ex.type === 'letter') ex.questions = makeLetterSoundQuestions(ex.cards, seed);
+      else if (ex.type === 'phonetic') ex.questions = makePhoneticCardQuestions(ex.cards, seed);
+      else ex.questions = makeBlendQuestions(ex.cards, seed);
+      ex.step = 0; ex.cards = null;
+      renderQuiz('🧠 小测验', '刚学的 ' + ex.questions.length + ' 题，答对越多积分越高');
     } else if (ex.type === 'letter') renderLetter();
     else if (ex.type === 'blend') renderBlend();
     else renderPhonetic();
   }
   function renderGrammar() {
+    ex.total = 1;
     const g = ex.item;
     openModal(modalHead('🧩 语法小课堂') +
       '<div class="reward-banner">今日语法点：' + esc(g.title) + '</div>' +
@@ -1521,6 +1892,8 @@ const App = (function () {
       '<button class="btn primary big" data-action="finish">完成本节课 →</button>';
   }
   function renderReading() {
+    ex.total = ex.item.qs.length;
+    ex.readingDone = {};
     const p = ex.item;
     openModal(modalHead('📚 阅读闯关 · ' + esc(p.title)) +
       '<div class="sentence-display" style="text-align:left;font-size:16px">' + esc(p.text) + '</div>' +
@@ -1534,8 +1907,8 @@ const App = (function () {
   }
   function readingAnswer(qi, i) {
     const q = ex.item.qs[qi];
-    if (q.done) return;
-    q.done = true;
+    if (ex.readingDone[qi]) return;
+    ex.readingDone[qi] = true;
     const right = i === q.ans;
     if (right) ex.correct++;
     $$('[data-action="readingOpt"][data-q="' + qi + '"]').forEach((b, idx) => { b.classList.add('disabled'); if (idx === q.ans) b.classList.add('right'); else if (idx === i) b.classList.add('wrong'); });
@@ -1543,6 +1916,7 @@ const App = (function () {
     toast((right ? '✅ ' : '❌ ') + (spoken || (right ? '答对啦！' : '再想想，正确答案是 ' + String.fromCharCode(65 + q.ans))));
   }
   function renderSpeaking() {
+    ex.total = 1;
     const t = ex.item;
     const supported = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
     openModal(modalHead('🎤 口语跟读') +
@@ -1705,7 +2079,6 @@ const App = (function () {
     state.dialogueStats.total += total;
     state.dialogueStats.good += good;
     state.dialogueStats.weak = weak.slice(0, 12);
-    const gained = awardOnce('dialogue:' + dateKey(), 25);
     saveState();
     dialogueState = null;
     openModal(modalHead('🎉 对话完成') +
@@ -1713,7 +2086,7 @@ const App = (function () {
       '<div class="center" style="font-size:48px;margin:8px 0">' + (pct >= 75 ? '🏆' : (pct >= 50 ? '🌟' : '💪')) + '</div>' +
       '<p class="center">' + (pct >= 75 ? '对话很流畅，继续保持！' : '多说几遍就顺了，下次再挑战') + '</p>' +
       (weak.length ? '<p class="muted center" style="font-size:12px">这些句子再练练：' + esc(weak.join(' / ')) + '</p>' : '') +
-      '<div class="center muted" style="font-size:12px;margin:8px 0">' + (gained > 0 ? '+' + gained + ' XP 到手' : '今日对话奖励已领过') + '</div>' +
+      '<div class="center muted" style="font-size:12px;margin:8px 0">自由口语练习不计积分，开口就是进步</div>' +
       '<button class="btn primary big" data-action="dlgRetry">换个场景再练一次</button>' +
       '<button class="btn big" data-action="close" style="margin-top:8px">完成，返回 →</button>');
     confetti();
@@ -1746,15 +2119,21 @@ const App = (function () {
   function finishExercise() {
     if (!ex) return;
     applyReviewResults();
-    const base = { letter: 15, words: 25, phonetic: 15, grammar: 20, listening: 20, reading: 20, speaking: 20, game: 20, review: 20, mock: 30, dueReview: 25 }[ex.type] || 15;
-    const task = ex.taskId ? dailyTasks().find(t => t.id === ex.taskId) : null;
-    // 经验值固定为任务卡标注的数值；重复完成同一项当天不再发放
-    const xp = task ? completeTask(task.id, task.xp) : awardOnce('free:' + ex.type, base);
-    const score = ex.correct;
+    const task = ex.taskId ? taskById(ex.taskId) : null;
+    const score = ex.correct || 0;
+    const total = ex.total || (ex.questions ? ex.questions.length : 0) || 1;
+    // 自由学习区不发放积分；每日任务按「答对题数 / 总题数」比例发放，当天重做只补差额
+    const target = task ? taskXpFor(task, score, total) : 0;
+    const xp = task ? completeTask(task.id, target) : 0;
+    const accumulated = task ? (state.xpLog[dateKey()] && state.xpLog[dateKey()]['task:' + task.id]) || 0 : 0;
     const type = ex.type;
     const wrongWords = type === 'dueReview' && ex.wrongWords ? ex.wrongWords.slice(0, 3) : [];
     ex = null;
-    const xpLine = xp > 0 ? '+' + xp + ' XP 经验值到手！' : '今日这项经验值已领过，继续练习也很棒！';
+    let xpLine;
+    if (!task) xpLine = '自由练习不计积分，练多少都算数！';
+    else if (target <= 0) xpLine = '答对 ' + score + '/' + total + ' 题，本次暂不得分，再练一次还能补上';
+    else if (xp <= 0) xpLine = '答对 ' + score + '/' + total + ' 题，今日这项已累计 ' + accumulated + '/' + task.xp + ' XP';
+    else xpLine = '+' + xp + ' XP（答对 ' + score + '/' + total + ' 题，本题组最高 ' + task.xp + ' XP）';
     const finishHtml = modalHead('🎉 挑战完成') +
       '<div class="reward-banner" style="font-size:18px">' + xpLine + '</div>' +
       '<div class="center" style="font-size:52px;margin:10px 0">' + (score > 0 ? '🌟' : '💪') + '</div>' +
@@ -1767,7 +2146,8 @@ const App = (function () {
     } else {
       openModal(finishHtml);
     }
-    confetti(); toast(xp > 0 ? '🎉 太棒了！获得 ' + xp + ' XP' : '🌟 今日这项经验值已领过，练习继续加油！');
+    if (xp > 0) confetti();
+    toast(xp > 0 ? '🎉 太棒了！获得 ' + xp + ' XP' : (task ? '🌟 答对 ' + score + '/' + total + '，继续加油！' : '🌟 自由练习完成！'));
   }
 
   /* ---------- 事件处理 ---------- */
@@ -1784,14 +2164,16 @@ const App = (function () {
   }
   /* ---------- 默写测验：听朗读 + 看中文 → 手写 → OCR 自动判分 ---------- */
   let ocrWorker = null;
-  function dictationItems() {
+  function dictationItems(scope) {
+    const all = scope === 'all';
     const S = Date.now();
     const items = [];
     const t = dailyTasks().find(x => x.id === 'b');
     const cfg = t && t.cfg;
-    const src = cfg && cfg.src === 'easy' ? EASY_WORDS : ALL_WORDS;
+    const src = all ? ALL_WORDS : (cfg && cfg.src === 'easy' ? EASY_WORDS : ALL_WORDS);
     const start = cfg ? cfg.start : 0;
-    const wordPool = src.slice(start, start + (cfg ? cfg.count : 8)).filter(w => w.cn);
+    const wordPool = all ? seededShuffle(ALL_WORDS.filter(w => w.cn), S).slice(0, 4)
+      : src.slice(start, start + (cfg ? cfg.count : 8)).filter(w => w.cn);
     seededShuffle(wordPool, S).slice(0, 4).forEach(w => {
       items.push({ kind:'单词', text:w.w, sub:w.cn + (w.ph ? ' ' + w.ph : ''),
         prompt:w.cn + (w.ph ? '（' + w.ph + '）' : ''), audio:w.w, answer:w.w, srsKind:'w', srsId:w.w });
@@ -1863,10 +2245,10 @@ const App = (function () {
     ocrWorker = await window.Tesseract.createWorker('eng', 1, ocrPaths());
     return ocrWorker;
   }
-  function openDictation() {
+  function openDictation(scope) {
     ex = null; writeState = null; closeModal();
-    openWritePad(dictationItems(), { mode:'dictation' });
-    toast('✍️ 默写测验开始：听发音、看中文，写出英文');
+    openWritePad(dictationItems(scope), { mode:'dictation' });
+    toast(scope === 'all' ? '🎓 四级词库默写：4642 词随机抽题，听音看义写英文' : '✍️ 默写测验开始：听发音、看中文，写出英文');
   }
 
   function openWritePad(items, opts) {
@@ -1950,20 +2332,40 @@ const App = (function () {
     if (!w || !w.ctx) return;
     drawWriteScene(w.ctx, w.w, w.h, w.guide);
   }
+  // 用「布局尺寸」建立画布坐标系：getBoundingClientRect 会被弹窗缩放动画/全屏变换污染，
+  // 用 clientWidth/clientHeight 才能保证画布像素、笔画坐标、手指位置三者一致。
+  function writeLayoutSize(c) {
+    return { w: c.clientWidth || c.offsetWidth || 0, h: c.clientHeight || c.offsetHeight || 0 };
+  }
   function setupWriteCanvas() {
     const c = $('#writeCanvas');
     const w = writeState;
     if (!c || !w) return;
-    const rect = c.getBoundingClientRect();
+    const size = writeLayoutSize(c);
+    if (size.w < 2 || size.h < 2) return; // 还没完成布局，等下一次回调
     const dpr = window.devicePixelRatio || 1;
-    c.width = Math.round(rect.width * dpr); c.height = Math.round(rect.height * dpr);
+    // 横竖屏切换后画布尺寸会变：把已有笔画按新尺寸等比缩放，避免旧笔迹跑到别处
+    if (w.w > 2 && w.h > 2 && (Math.abs(w.w - size.w) > 1 || Math.abs(w.h - size.h) > 1)) {
+      const kx = size.w / w.w, ky = size.h / w.h;
+      const scalePts = pts => pts.forEach(p => { p.x *= kx; p.y *= ky; });
+      (w.strokes || []).forEach(s => scalePts(s.points));
+      if (w.cur) scalePts(w.cur.points);
+    }
+    c.width = Math.round(size.w * dpr); c.height = Math.round(size.h * dpr);
     const ctx = c.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    w.ctx = ctx; w.w = rect.width; w.h = rect.height;
+    w.ctx = ctx; w.w = size.w; w.h = size.h;
     redrawWrite();
-    const pos = e => { const r = c.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+    // 手指坐标换算到布局坐标系，抵消祖先元素的 transform 缩放（弹窗入场动画、全屏缩放、浏览器缩放）
+    const pos = e => {
+      const r = c.getBoundingClientRect();
+      const sx = r.width ? r.width / (c.clientWidth || c.offsetWidth || r.width) : 1;
+      const sy = r.height ? r.height / (c.clientHeight || c.offsetHeight || r.height) : 1;
+      return { x: (e.clientX - r.left) / sx, y: (e.clientY - r.top) / sy };
+    };
     c.onpointerdown = e => {
-      e.preventDefault(); c.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      try { c.setPointerCapture(e.pointerId); } catch (err) { /* 某些浏览器/触控笔不支持捕获，忽略即可继续书写 */ }
       w.cur = { color: w.color, size: w.size, points: [pos(e)] }; redrawWrite();
     };
     c.onpointermove = e => {
@@ -1972,6 +2374,13 @@ const App = (function () {
     };
     const finish = () => { if (w.cur) { w.strokes.push(w.cur); w.cur = null; redrawWrite(); } };
     c.onpointerup = finish; c.onpointercancel = finish; c.onpointerleave = finish;
+  }
+  // 旋转/窗口尺寸变化后必须重建画布，否则横屏会出现「手写 A 处、显示 B 处」的错位
+  function onWriteViewportChange() {
+    if (!writeState) return;
+    setupWriteCanvas();
+    setTimeout(setupWriteCanvas, 120);
+    setTimeout(setupWriteCanvas, 380);
   }
   /* 全屏书写：优先用系统全屏（可旋转横屏），iOS 不支持时用 CSS 铺满兜底 */
   function setWriteFull(on) {
@@ -1997,8 +2406,7 @@ const App = (function () {
       tip.textContent = '横屏书写体验更佳 · 点上方按钮或按 Esc 退出全屏';
       box.appendChild(tip);
     }
-    setTimeout(setupWriteCanvas, 60);
-    setTimeout(setupWriteCanvas, 320);
+    onWriteViewportChange();
   }
   function writeStep(delta) {
     const w = writeState;
@@ -2038,6 +2446,11 @@ const App = (function () {
     w.checking = false;
     if (w.fs) setWriteFull(false);
     w.results.push(Object.assign({ item:item, userStrokes:w.strokes.map(x => x) }, result));
+    if (item.kind === '单词' && item.answer) {
+      const prev = state.learnedWords[item.answer];
+      state.learnedWords[item.answer] = { cnt:(prev ? prev.cnt : 0) + 1, t:dateKey() };
+      saveState();
+    }
     const okTxt = result.ok === null ? '⚠️ 识别暂不可用，请对照答案自己判断' : (result.ok ? '✅ 写对了！' : '❌ 再看一下');
     const pctTxt = (result.ok === false && result.pct != null) ? '（正确词 ' + result.pct + '%）' : '';
     openModal(modalHead('📝 判分结果 · ' + item.kind) +
@@ -2065,7 +2478,6 @@ const App = (function () {
     const good = rs.filter(r => r.ok === true).length;
     const bad = rs.filter(r => r.ok === false).length;
     const pct = rs.length ? Math.round(good / rs.length * 100) : 0;
-    const gained = awardOnce('dictation:' + dateKey(), 20);
     const wrongList = rs.filter(r => r.ok === false).map(r => r.item.answer);
     writeState = null;
     openModal(modalHead('🎉 默写完成') +
@@ -2073,7 +2485,7 @@ const App = (function () {
       '<div class="center" style="font-size:52px;margin:10px 0">' + (pct >= 80 ? '🏆' : (pct >= 50 ? '🌟' : '💪')) + '</div>' +
       '<p class="center">' + (pct >= 80 ? '默写得很扎实，继续保持！' : '别灰心，写错的已进复习，多写几遍就记住了') + '</p>' +
       (wrongList.length ? '<p class="muted center" style="font-size:12px">需复习：' + esc(wrongList.join('、')) + '</p>' : '') +
-      '<div class="center muted" style="font-size:12px;margin:8px 0">' + (gained > 0 ? '+' + gained + ' XP 到手' : '今日默写奖励已领过') + '</div>' +
+      '<div class="center muted" style="font-size:12px;margin:8px 0">自由默写不计积分，多写一遍就多一分熟练</div>' +
       '<button class="btn primary big" data-action="close">完成，返回 →</button>');
     confetti();
   }
@@ -2090,12 +2502,7 @@ const App = (function () {
       toast('✅ 错词已写完，复习完成');
       return;
     }
-    const key = 'write_' + dateKey();
-    if (!state.completed[key]) {
-      state.completed[key] = true;
-      award(5);
-      toast('✍️ 手写练习完成，+5 XP');
-    } else toast('今天的手写奖励已领取过啦');
+    toast('✍️ 已保存今天的自由书写练习（自由学习区不计积分）');
     closeModal();
   }
   function writeSave() {
@@ -2113,6 +2520,213 @@ const App = (function () {
     a.click();
     toast('💾 手写图片已保存');
   }
+  /* ---------- 四级错题本 ---------- */
+  function openWrongBook() {
+    const keys = Object.keys(state.wrongBook || {});
+    if (!keys.length) { openModal(modalHead('📕 四级错题本') + '<div class="card center" style="padding:28px">目前还没有错题。做四级听力、阅读或模考时答错的题会自动收集到这里。<br><br><button class="btn primary" data-action="close">知道了</button></div>'); return; }
+    const html = keys.map(k => {
+      const w = state.wrongBook[k];
+      return '<div class="arch-item"><div class="arch-row"><div class="arch-main">' + esc((w.q || '').replace(/\n/g, ' ').slice(0, 90)) + '</div><button class="arch-play" data-action="wrongSpeak" data-id="' + esc(k) + '">🔊</button></div>' +
+        '<div class="arch-sub">' + esc(w.type || '练习') + ' · ' + esc(w.t || '') + ' · 错 ' + (w.count || 1) + ' 次</div>' +
+        '<div class="arch-foot"><button class="btn sm primary" data-action="wrongReview" data-id="' + esc(k) + '">▶ 重做</button> <button class="btn sm danger" data-action="wrongRemove" data-id="' + esc(k) + '">移除</button></div></div>';
+    }).join('');
+    openModal(modalHead('📕 四级错题本 · ' + keys.length + ' 题') + '<div class="arch-list">' + html + '</div><div style="margin-top:12px"><button class="btn" data-action="close">返回</button></div>');
+  }
+  function wrongReview(id) {
+    const w = state.wrongBook[id];
+    if (!w) return;
+    ex = { type:'wrongBook', cfg:{}, step:0, correct:0, locked:false, questions:[{ id:w.id, q:w.q, audio:w.audio, opts:w.opts, ans:w.ans, why:w.why, type:w.type }] };
+    renderQuiz('📕 错题重做', w.type + ' · 答对后自动移出错题本');
+  }
+
+  /* ---------- 四级写作 ---------- */
+  let writingState = null;
+  function openWriting(id, taskId) {
+    const item = CET4_WRITING.find(x => x.id === id) || CET4_WRITING[0];
+    writingState = { item, taskId: taskId || null };
+    const prev = state.writings[item.id];
+    openModal(modalHead('✍️ 四级写作 · ' + esc(item.title)) +
+      '<div class="reward-banner">' + esc(item.prompt) + '</div>' +
+      '<textarea id="writingText" rows="9" placeholder="在这里写你的作文（建议 120 词以上）" style="width:100%;padding:12px;border:2px solid var(--line);border-radius:12px;line-height:1.6">' + esc(prev ? prev.text : '') + '</textarea>' +
+      '<p class="muted" style="font-size:12px">写完点提交，可对照范文、中文意思和常用词组。' + (writingState.taskId ? '本题按写作完成度发放积分。' : '自由练习不计积分。') + '</p>' +
+      '<button class="btn primary big" data-action="writingSubmit">提交并看范文 →</button>');
+  }
+  function submitWriting() {
+    if (!writingState) return;
+    const item = writingState.item;
+    const text = ($('#writingText') && $('#writingText').value || '').trim();
+    const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+    if (words < 20) { toast('再多写几句吧，至少 20 词才能对照范文'); return; }
+    const lower = text.toLowerCase();
+    const phrases = (item.phrases || []).filter(p => lower.indexOf(String(p).toLowerCase()) !== -1).length;
+    const score = clamp(Math.round(words / 120 * 70 + phrases * 8), 0, 100);
+    state.writings[item.id] = { text, words, score, t:dateKey() };
+    saveState();
+    const gained = writingState.taskId ? awardTaskScore(writingState.taskId, score, 100) : 0;
+    const gainLine = writingState.taskId
+      ? (gained > 0 ? '+' + gained + ' XP（按写作完成度 ' + score + ' 分发放）' : '本次按完成度 ' + score + ' 分计分，自由修改后再提交可补差额')
+      : '自由练习不计积分。';
+    openModal(modalHead('✅ 写作已保存 · ' + esc(item.title)) +
+      '<div class="reward-banner">你写了 ' + words + ' 词 · ' + (words >= 120 ? '达到四级作文长度要求' : '建议写到 120 词以上') + ' · ' + gainLine + '</div>' +
+      '<div class="arch-item"><div class="arch-main">参考范文</div><div class="arch-sub">' + esc(item.model) + '</div>' +
+      '<div class="arch-cn">中文意思：' + esc(item.modelCn) + '</div>' +
+      '<div class="arch-foot"><button class="btn sm" data-action="speak" data-text="' + esc(item.model) + '">🔊 听范文</button></div></div>' +
+      '<div class="arch-item"><div class="arch-main">可套用词组</div>' + item.phrases.map(p => '<div class="arch-sub">· ' + esc(p) + '</div>').join('') + '</div>' +
+      '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" data-action="writingAgain">再写一遍</button><button class="btn" data-action="close">返回</button></div>');
+  }
+
+  /* ---------- 四级翻译 ---------- */
+  let transExState = null;
+  function openTranslationExercise(id, taskId) {
+    const item = CET4_TRANSLATION.find(x => x.id === id) || CET4_TRANSLATION[0];
+    transExState = { item, taskId: taskId || null };
+    const prev = state.translations[item.id];
+    openModal(modalHead('🌏 四级翻译 · 汉译英') +
+      '<div class="reward-banner">' + esc(item.cn) + '</div>' +
+      '<textarea id="transExText" rows="7" placeholder="把上面的中文翻译成英文" style="width:100%;padding:12px;border:2px solid var(--line);border-radius:12px;line-height:1.6">' + esc(prev ? prev.text : '') + '</textarea>' +
+      '<div class="arch-sub" style="margin-top:8px">词组提示：' + item.phrases.map(esc).join(' · ') + '</div>' +
+      '<button class="btn primary big" data-action="transExSubmit">提交并看参考译文 →</button>');
+  }
+  function submitTranslationExercise() {
+    if (!transExState) return;
+    const item = transExState.item;
+    const text = ($('#transExText') && $('#transExText').value || '').trim();
+    if (!text) { toast('先写下你的英文翻译'); return; }
+    const mine = new Set(text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean));
+    const ref = item.model.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+    const hit = ref.filter(w => mine.has(w)).length;
+    const score = ref.length ? Math.round(hit / new Set(ref).size * 100) : 0;
+    state.translations[item.id] = { text, score, t:dateKey() };
+    saveState();
+    const gained = transExState.taskId ? awardTaskScore(transExState.taskId, score, 100) : 0;
+    const gainLine = transExState.taskId
+      ? (gained > 0 ? '+' + gained + ' XP（按覆盖率 ' + score + ' 分发放）' : '本次按覆盖率 ' + score + ' 分计分，修改后再提交可补差额')
+      : '自由练习不计积分。';
+    openModal(modalHead('✅ 翻译已保存') +
+      '<div class="reward-banner">参考词覆盖率约 ' + clamp(score, 0, 100) + '%（粗略参考，请对照译文自行判断） · ' + gainLine + '</div>' +
+      '<div class="arch-item"><div class="arch-main">你的翻译</div><div class="arch-sub">' + esc(text) + '</div></div>' +
+      '<div class="arch-item"><div class="arch-main">参考译文</div><div class="arch-sub">' + esc(item.model) + '</div>' +
+      '<div class="arch-foot"><button class="btn sm" data-action="speak" data-text="' + esc(item.model) + '">🔊 听译文</button></div></div>' +
+      '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" data-action="transExAgain">再译一遍</button><button class="btn" data-action="close">返回</button></div>');
+  }
+
+  /* ---------- 中英互译 ---------- */
+  let transState = { dir:'en2zh', q:'' };
+  function openTranslate() { transState = { dir:'en2zh', q:'' }; renderTranslate(); }
+  function renderTranslate() {
+    const d = transState.dir;
+    const results = transState.q ? translateLookup(transState.q, d) : [];
+    const body = results.length ? results.map(r =>
+      '<div class="arch-item"><div class="arch-row"><div class="arch-main">' + esc(r.main) + '</div><button class="arch-play" data-action="transSpeak" data-text="' + esc(r.speak || r.main) + '">🔊</button></div>' +
+      (r.ph ? '<div class="arch-ph">' + esc(r.ph) + '</div>' : '') +
+      '<div class="arch-cn">' + esc(r.cn) + '</div>' +
+      (r.note ? '<div class="arch-sub">' + esc(r.note) + '</div>' : '') +
+      (r.word ? '<div class="arch-foot"><button class="btn sm" data-action="transLearn" data-word="' + esc(r.word) + '">＋ 加入已学词</button></div>' : '') + '</div>'
+    ).join('') : '<div class="card center muted" style="padding:24px">输入英文或中文，即可查询词库与内置例句/范文/译文中的对应表达。</div>';
+    openModal(modalHead('🔁 中英互译 · 离线词句库') +
+      '<div class="arch-tabs"><button class="arch-tab' + (d === 'en2zh' ? ' active' : '') + '" data-action="transDir" data-dir="en2zh">英文 → 中文</button>' +
+      '<button class="arch-tab' + (d === 'zh2en' ? ' active' : '') + '" data-action="transDir" data-dir="zh2en">中文 → 英文</button></div>' +
+      '<div class="arch-search"><input id="transInput" type="search" placeholder="' + (d === 'en2zh' ? '输入英文单词或句子' : '输入中文词句') + '" value="' + esc(transState.q) + '"></div>' +
+      '<div style="margin:8px 0"><button class="btn primary" data-action="transGo">🔍 翻译</button></div>' +
+      '<div class="arch-meta">' + (transState.q ? '找到 ' + results.length + ' 条结果' : '支持 4642 词 + 四级范文/译文/阅读例句') + '</div>' +
+      '<div class="arch-list">' + body + '</div>');
+    const input = $('#transInput');
+    if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') { transState.q = input.value; renderTranslate(); } });
+  }
+  function translateLookup(q, dir) {
+    const s = String(q || '').trim().toLowerCase();
+    if (!s) return [];
+    const out = [];
+    if (dir === 'en2zh') {
+      ALL_WORDS.forEach(w => {
+        if (w.w.toLowerCase() === s || (s.length > 3 && w.w.toLowerCase().indexOf(s) === 0)) {
+          out.push({ main:w.w, ph:w.ph, cn:w.cn || '', note:w.ex ? '例：' + w.ex + ' ' + (w.cnEx || '') : '', speak:w.w, word:w.w });
+        }
+      });
+      const sentencePools = [
+        CET4_TRANSLATION.map(x => ({ en:x.model, cn:x.cn, note:'四级翻译参考' })),
+        CET4_WRITING.map(x => ({ en:x.model, cn:x.modelCn, note:'四级写作范文' })),
+        CET4_CAREFUL.map(x => ({ en:x.text, cn:'（仔细阅读短文）', note:x.title })),
+        CET4_LISTENING.map(x => ({ en:x.audio, cn:x.why || '', note:'四级听力原文' }))
+      ];
+      sentencePools.forEach(pool => pool.forEach(x => { if (x.en.toLowerCase().indexOf(s) !== -1) out.push({ main:x.en.slice(0, 180), cn:x.cn, note:x.note, speak:x.en.slice(0, 180) }); }));
+    } else {
+      ALL_WORDS.forEach(w => { if (w.cn && w.cn.indexOf(q) !== -1) out.push({ main:w.w, ph:w.ph, cn:w.cn, note:'词库词条', speak:w.w, word:w.w }); });
+      CET4_TRANSLATION.forEach(x => { if (x.cn.indexOf(q) !== -1 || x.model.toLowerCase().indexOf(s) !== -1) out.push({ main:x.model, cn:x.cn, note:'四级翻译参考', speak:x.model }); });
+      CET4_WRITING.forEach(x => { if ((x.modelCn || '').indexOf(q) !== -1) out.push({ main:x.model, cn:x.modelCn, note:'四级写作范文', speak:x.model }); });
+    }
+    const seen = {}, uniq = [];
+    out.forEach(x => { const k = x.main.slice(0, 80); if (!seen[k]) { seen[k] = 1; uniq.push(x); } });
+    return uniq.slice(0, 40);
+  }
+
+  /* ---------- 四级完整模考 ---------- */
+  let fm = null;
+  function openFullMock(taskId) {
+    fm = { paper:makeFullMock(Date.now()), sec:0, idx:0, answers:{}, scores:{}, start:Date.now(), translation:'', writing:'', taskId: taskId || null };
+    renderFullMock();
+  }
+  function fmObjective() {
+    if (fm.sec === 0) return fm.paper.listening;
+    if (fm.sec === 1) return fm.paper.vocab;
+    if (fm.sec === 2) return fm.paper.reading;
+    return [];
+  }
+  function renderFullMock() {
+    if (!fm) return;
+    const names = ['听力理解', '词汇语法', '阅读理解', '翻译（汉译英）', '写作', '成绩报告'];
+    const head = modalHead('📝 四级真题模考 · ' + names[fm.sec]) +
+      '<div class="reward-banner">完整流程：听力 5 题 → 词汇语法 5 题 → 阅读 2 题 → 翻译 1 篇 → 写作 1 篇 · ' + (fm.taskId ? '每日任务按正确量计分' : '自由模考不计积分') + '</div>';
+    if (fm.sec <= 2) {
+      const qs = fmObjective();
+      const q = qs[fm.idx];
+      if (!q) { fm.sec++; fm.idx = 0; renderFullMock(); return; }
+      openModal(head + '<p class="muted">第 ' + (fm.idx + 1) + '/' + qs.length + ' 题</p>' +
+        (q.audio ? '<div class="listening-box"><button class="btn sm" data-action="fmSpeak" data-text="' + esc(q.audio) + '">🔊 播放</button></div>' : '') +
+        '<div class="quiz-q">' + esc(q.q) + '</div>' +
+        '<div class="opts">' + q.opts.map((o, i) => '<button class="opt' + (fm.answers[fm.sec + ':' + fm.idx] === i ? ' right' : '') + '" data-action="fmOpt" data-i="' + i + '">' + String.fromCharCode(65 + i) + '. ' + esc(o) + '</button>').join('') + '</div>' +
+        '<div style="margin-top:12px"><button class="btn primary" data-action="fmNext">' + (fm.idx < qs.length - 1 ? '下一题 →' : '完成本部分 →') + '</button></div>');
+      if (q.audio) setTimeout(() => speak(q.audio), 250);
+      return;
+    }
+    if (fm.sec === 3) {
+      const t = fm.paper.translation;
+      openModal(head + '<div class="reward-banner">' + esc(t.cn) + '</div><div class="arch-sub">提示词组：' + t.phrases.map(esc).join(' · ') + '</div>' +
+        '<textarea id="fmTrans" rows="7" style="width:100%;padding:12px;border:2px solid var(--line);border-radius:12px">' + esc(fm.translation) + '</textarea>' +
+        '<button class="btn primary big" data-action="fmTransSubmit">提交翻译 →</button>');
+      return;
+    }
+    if (fm.sec === 4) {
+      const w = fm.paper.writing;
+      openModal(head + '<div class="reward-banner">' + esc(w.prompt) + '</div>' +
+        '<textarea id="fmWrite" rows="9" style="width:100%;padding:12px;border:2px solid var(--line);border-radius:12px">' + esc(fm.writing) + '</textarea>' +
+        '<button class="btn primary big" data-action="fmWriteSubmit">交卷并查看成绩 →</button>');
+      return;
+    }
+    const objTotal = fm.paper.listening.length + fm.paper.vocab.length + fm.paper.reading.length;
+    let objRight = 0;
+    [[0, fm.paper.listening], [1, fm.paper.vocab], [2, fm.paper.reading]].forEach(pair => {
+      pair[1].forEach((q, i) => { if (fm.answers[pair[0] + ':' + i] === q.ans) objRight++; });
+    });
+    const objPct = Math.round(objRight / objTotal * 100);
+    const tr = fm.paper.translation, wr = fm.paper.writing;
+    const trScore = clamp(fm.scores.translation || 0, 0, 100);
+    const wrScore = clamp(fm.scores.writing || 0, 0, 100);
+    const gained = fm.taskId ? awardTaskScore(fm.taskId, objRight + trScore / 100 + wrScore / 100, objTotal + 2) : 0;
+    const gainLine = fm.taskId
+      ? (gained > 0 ? ' · +' + gained + ' XP（按正确量发放）' : ' · 本次未获得新积分，重做可补差额')
+      : ' · 自由模考不计积分';
+    state.mockScores.push({ date:dateKey(), score:objPct, detail:{ objective:objRight + '/' + objTotal, translation:trScore, writing:wrScore } });
+    saveState();
+    openModal(head + '<div class="reward-banner" style="font-size:20px">客观题 ' + objRight + '/' + objTotal + ' · ' + objPct + ' 分' + gainLine + '</div>' +
+      '<div class="arch-item"><div class="arch-main">翻译参考分 ' + (fm.scores.translation || 0) + ' 分</div><div class="arch-sub">' + esc(tr.model) + '</div><div class="arch-cn">中文：' + esc(tr.cn) + '</div></div>' +
+      '<div class="arch-item"><div class="arch-main">写作参考分 ' + (fm.scores.writing || 0) + ' 分</div><div class="arch-sub">' + esc(wr.model) + '</div><div class="arch-cn">中文：' + esc(wr.modelCn) + '</div>' +
+      '<div class="arch-foot"><button class="btn sm" data-action="speak" data-text="' + esc(wr.model) + '">🔊 听范文</button></div></div>' +
+      '<p class="muted" style="font-size:12px">翻译/写作参考分由词覆盖率与长度粗略计算，请对照范文自行判断。完整错题可在「四级错题本」复习。</p>' +
+      '<div style="margin-top:12px"><button class="btn primary big" data-action="close">完成</button></div>');
+    fm = null;
+  }
+
   function onClick(e) {
     const nav = e.target.closest('[data-nav]');
     if (nav) { go(nav.dataset.nav); return; }
@@ -2124,9 +2738,16 @@ const App = (function () {
     }
     const mod = e.target.closest('[data-mod]');
     if (mod) {
-      if (mod.dataset.mod === 'write') openWritePad();
+      if (mod.dataset.mod === 'archive') goArchive();
+      else if (mod.dataset.mod === 'write') openWritePad();
       else if (mod.dataset.mod === 'dictation') openDictation();
+      else if (mod.dataset.mod === 'dictationAll') openDictation('all');
       else if (mod.dataset.mod === 'dialogue') openDialogue();
+      else if (mod.dataset.mod === 'writing') openWriting();
+      else if (mod.dataset.mod === 'translation') openTranslationExercise();
+      else if (mod.dataset.mod === 'mockFull') openFullMock();
+      else if (mod.dataset.mod === 'wrongBook') openWrongBook();
+      else if (mod.dataset.mod === 'translate') openTranslate();
       else startExercise(mod.dataset.mod);
       return;
     }
@@ -2139,6 +2760,38 @@ const App = (function () {
       closeModal();
     }
     else if (a === 'speak') speak(el.dataset.text);
+    else if (a === 'goArchive') goArchive();
+    else if (a === 'archBack') go('learn');
+    else if (a === 'archTab') { archiveState.cat = el.dataset.cat; archiveState.q = ''; renderArchive(); }
+    else if (a === 'archScope') { archiveState.scope = archiveState.scope === 'all' ? 'learned' : 'all'; archiveState.q = ''; renderArchive(); }
+    else if (a === 'archExport') openExportDialog();
+    else if (a === 'expScope') { exportSelection.scope = el.dataset.scope; openExportDialog(); }
+    else if (a === 'expAll') { EXPORT_CATS.forEach(c => exportSelection[c[0]] = true); openExportDialog(); }
+    else if (a === 'expNone') { EXPORT_CATS.forEach(c => exportSelection[c[0]] = false); openExportDialog(); }
+    else if (a === 'expDo') {
+      $$('[data-exp-cat]').forEach(cb => { exportSelection[cb.dataset.expCat] = cb.checked; });
+      exportArchiveExcel();
+    }
+    else if (a === 'wrongReview') wrongReview(el.dataset.id);
+    else if (a === 'wrongSpeak') { const w = state.wrongBook[el.dataset.id]; if (w && w.audio) speak(w.audio); else toast('这道题没有朗读音频'); }
+    else if (a === 'wrongRemove') { delete state.wrongBook[el.dataset.id]; saveState(); openWrongBook(); }
+    else if (a === 'writingSubmit') submitWriting();
+    else if (a === 'writingAgain') { if (writingState) openWriting(writingState.item.id); }
+    else if (a === 'transExSubmit') submitTranslationExercise();
+    else if (a === 'transExAgain') { if (transExState) openTranslationExercise(transExState.item.id); }
+    else if (a === 'transDir') { transState.dir = el.dataset.dir; transState.q = ''; renderTranslate(); }
+    else if (a === 'transGo') { const i = $('#transInput'); transState.q = i ? i.value : ''; renderTranslate(); }
+    else if (a === 'transSpeak') speak(el.dataset.text);
+    else if (a === 'transLearn') {
+      const w = el.dataset.word;
+      if (w) { state.learnedWords[w] = { cnt:1, t:dateKey() }; if (!state.srs['w:'+w]) scheduleItem('w', w, dateKey()); saveState(); toast('已加入已学词，可在学习档案查看'); }
+    }
+    else if (a === 'fmSpeak') speak(el.dataset.text);
+    else if (a === 'fmOpt' && fm) { fm.answers[fm.sec + ':' + fm.idx] = Number(el.dataset.i); renderFullMock(); }
+    else if (a === 'fmNext' && fm) { fm.idx++; renderFullMock(); }
+    else if (a === 'fmTransSubmit' && fm) { fm.translation = ($('#fmTrans') && $('#fmTrans').value || '').trim(); if (!fm.translation) { toast('先写下你的翻译'); return; } const ref = fm.paper.translation.model.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean); const mine = new Set(fm.translation.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean)); fm.scores.translation = Math.round(ref.filter(x => mine.has(x)).length / Math.max(1, new Set(ref).size) * 100); fm.sec++; renderFullMock(); }
+    else if (a === 'fmWriteSubmit' && fm) { fm.writing = ($('#fmWrite') && $('#fmWrite').value || '').trim(); const n = fm.writing ? fm.writing.split(/\s+/).length : 0; const phrases = fm.paper.writing.phrases.filter(p => fm.writing.toLowerCase().indexOf(p.toLowerCase()) !== -1).length; fm.scores.writing = clamp(Math.round(n / 120 * 70 + phrases * 8), 0, 100); fm.sec++; renderFullMock(); }
+    else if (a === 'archSpeak') { const it = archiveFind(el.dataset.key); if (it) speak(it.audio || it.main, Math.max(.72, state.rate)); }
     else if (a === 'writeFull') { if (writeState) setWriteFull(!writeState.fs); }
     else if (a === 'dlgSpeak') dialogueSpeak();
     else if (a === 'dlgRec') dialogueStartRec();
@@ -2180,6 +2833,14 @@ const App = (function () {
       toast('😄 ' + (line || '试听完成') + '（' + voiceDisplayName(state.feedbackVoice) + '）');
     }
     else if (a === 'refreshVoices') { refreshVoiceSelect(); toast('已刷新语音列表'); }
+    else if (a === 'tryNatural') {
+      const nv = $('#setNaturalVoice');
+      if (nv) state.naturalVoice = nv.value === '1';
+      saveState();
+      const v = pickNaturalVoice('en-US');
+      speak('Good morning. Today we will learn three useful words: benefit, schedule and confidence. Let us begin.', .95, { voiceURI:'', noNatural:false });
+      toast('🔊 ' + (v ? '正在用「' + v.name + '」自然语音试听' : '正在用系统语音试听'));
+    }
     else if (a === 'recordVoice') toggleRecord();
     else if (a === 'previewVoice') {
       if (!state.voiceProfile) { toast('请先录一段生成语音包'); return; }
@@ -2206,6 +2867,8 @@ const App = (function () {
     else if (a === 'gameTile') gameTile(el.dataset.w, el.dataset.side);
     else if (a === 'finish') {
       if (ex && ex.type === 'grammar' && ex.grammarIdx != null) scheduleItem('g', ex.grammarIdx, dateKey());
+      // 没有语音识别权限时，点“我读好了”按完成 1 题计分；用了朗读评分则保留识别结果
+      if (ex && ex.type === 'speaking' && !ex.correct) ex.correct = 1;
       finishExercise();
     }
     else if (a === 'toggleTrans') { const t = $('#trans'); if (t) t.style.display = t.style.display === 'none' ? 'block' : 'none'; }
@@ -2233,6 +2896,9 @@ const App = (function () {
     if (s) state.startDate = s;
     const td = $('#setTargetDays');
     if (td) state.targetDays = Number(td.value);
+    state.level = 'zero'; // 起点固定，不受任何旧控件影响
+    const tg = $('#setTarget'); if (tg) state.target = tg.value;
+    const nv = $('#setNaturalVoice'); if (nv) state.naturalVoice = nv.value === '1';
     state.minutes = Number($('#setMinutes').value);
     state.rate = Number($('#setRate').value);
     const vs = $('#voiceSelect');
@@ -2291,9 +2957,17 @@ const App = (function () {
         if (btn) btn.textContent = '⛶ 全屏书写';
         const tip = $('.write-fs-tip');
         if (tip) tip.remove();
-        setTimeout(setupWriteCanvas, 80);
+        onWriteViewportChange();
+      } else if (document.fullscreenElement && writeState) {
+        onWriteViewportChange();
       }
     });
+    // 横竖屏切换/窗口变化：桌面端 resize，手机端 orientationchange + visualViewport
+    window.addEventListener('resize', onWriteViewportChange);
+    window.addEventListener('orientationchange', onWriteViewportChange);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', onWriteViewportChange);
+    }
     document.addEventListener('click', onClick);
     document.addEventListener('change', e => {
       const id = e.target && e.target.id;
