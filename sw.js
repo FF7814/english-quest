@@ -1,7 +1,7 @@
 /* 英语启航 - 离线缓存 Service Worker
  * 策略：网络优先、离线回退缓存。只要联网打开就是最新版本，断网时用已缓存的内容离线使用。
  */
-const CACHE = 'englishquest-v29';
+const CACHE = 'englishquest-v32';
 const FILES = [
   './',
   './index.html',
@@ -12,12 +12,7 @@ const FILES = [
   './js/app.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
-  './icons/icon-512.png',
-  './vendor/ocr/tesseract.min.js',
-  './vendor/ocr/worker.min.js',
-  './vendor/ocr/tesseract-core-simd-lstm.wasm.js',
-  './vendor/ocr/tesseract-core-simd-lstm.wasm',
-  './vendor/ocr/eng.traineddata.gz'
+  './icons/icon-512.png'
 ];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
