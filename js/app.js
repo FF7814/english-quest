@@ -3,10 +3,33 @@ const App = (function () {
   'use strict';
   const KEY = 'eq_state_v1';
   const SOURCE_DAYS = 670;
-  // 四级达成校核后调整：每词 4 次关键复习，配合每日 30 项上限，保证到期复习能当天做完、不积压
+  // 学习目标：默认自考英语二；新增 PETS-3（2028 年 3 月）备考模式；四级计划暂停，但完整工具保留
+  function examMode() { return state && state.target === 'cet4' ? 'cet4' : (state && state.target === 'pets3' ? 'pets3' : 'zx2'); }
+  // 四级达成校核后调整：每词 4 次关键复习；英语二/英语三级数固定且每日上限 36 项，
+  // 因此用 2 次关键复习（1 天、7 天）+ 每日复习巩固任务，保证到期复习能当天做完、不积压
   const REVIEW_INTERVALS = [1, 3, 7, 15];
+  const ZX2_REVIEW_INTERVALS = [1, 7];
+  function reviewIntervalsForMode(mode) { return mode === 'cet4' ? REVIEW_INTERVALS : ZX2_REVIEW_INTERVALS; }
+  function reviewIntervals() { return reviewIntervalsForMode(examMode()); }
+  // 四级沿用原有 3 次有效复习；英语二与 PETS-3 都压到 2 次，才能不超出每日 36 项上限
+  function reviewSteps() { return examMode() === 'cet4' ? REVIEW_INTERVALS.length - 1 : ZX2_REVIEW_INTERVALS.length; }
   const MAX_DUE_PER_DAY = 36;
   const EASY_WORDS = ALL_WORDS.filter(w => w.lvl <= 2); // 启蒙期高频词：少而精，反复巩固
+  // 按考试要求裁剪词库：英语二大纲 4500 词、PETS-3 大纲 4000 词、四级保留完整 4642 词。
+  // 词库结构为「启蒙 55 高频词 + 第一轮 a~z 基础词 + 第二轮 a~z 大纲词」，直接取前 N 个可完整保留
+  // 启蒙词与第一轮全部基础词，仅砍掉第二轮尾部的派生/高级词，不丢 school/water/work 等常用词。
+  const EXAM_WORD_LIMIT = { zx2: 4500, pets3: 4000, cet4: 4642 };
+  let examWordsCache = { key: null, words: null };
+  function examWords() {
+    const mode = examMode();
+    const limit = Math.min(EXAM_WORD_LIMIT[mode] || ALL_WORDS.length, ALL_WORDS.length);
+    if (limit >= ALL_WORDS.length) return ALL_WORDS;
+    if (examWordsCache.key === mode) return examWordsCache.words;
+    const out = ALL_WORDS.slice(0, limit);
+    examWordsCache = { key: mode, words: out };
+    return out;
+  }
+  function examWordLimit() { return Math.min(EXAM_WORD_LIMIT[examMode()] || ALL_WORDS.length, ALL_WORDS.length); }
   // 内置声音风格：不依赖系统语音列表，靠音调塑造不同"语音包"
   const VOICE_STYLES = [
     { key: 'style:gentle', name: '温柔女声', pitch: 1.4 },
@@ -91,28 +114,55 @@ const App = (function () {
   let lessonState = null; // 微课讲解状态（不覆盖答题会话）
   let lessonTimer = null;
 
-  /* ---------- 周期映射：默认 670 天逐日推进；缩短周期时按比例压缩，完整计划不跳课 ---------- */
-  function totalDays() { return clamp(state.targetDays || SOURCE_DAYS, 300, SOURCE_DAYS); }
+  /* ---------- 周期映射：英语二 330 天、PETS-3 476 天；四级 670 天计划仅保留给回归与工具 ---------- */
+  const PLAN_DAYS = { zx2: ZX2_DAYS, pets3: PETS3_DAYS, cet4: SOURCE_DAYS };
+  function totalDays() { return PLAN_DAYS[examMode()]; }
   function courseDay(day) {
     const real = day == null ? state.dayIndex : day;
-    const idx = Math.round((real - 1) * (SOURCE_DAYS - 1) / Math.max(1, totalDays() - 1));
-    return clamp(idx + 1, 1, SOURCE_DAYS);
+    const total = totalDays();
+    const idx = Math.round((real - 1) * (total - 1) / Math.max(1, total - 1));
+    return clamp(idx + 1, 1, total);
   }
   function realDayOf(c) {
-    const idx = Math.round((c - 1) * (totalDays() - 1) / (SOURCE_DAYS - 1));
-    return clamp(idx + 1, 1, totalDays());
+    const total = totalDays();
+    const idx = Math.round((c - 1) * (total - 1) / Math.max(1, total - 1));
+    return clamp(idx + 1, 1, total);
   }
   // 计划按用户真实情况固定：只认识字母名，不认识音标/单词/语法/句子。
   // 因此不提供中学/大学基础切换，任何一天都从同一份启蒙课程表推进，不跳过字母音、音标和自然拼读。
   function effectiveCourseDay(c) { return c; }
   // 按每日可学时长微调单词量，保证任务量合理
-  function dailyWordCount(base) {
+  function dailyWordCount(base, max) {
     const m = state.minutes || 33;
-    return clamp(Math.round(base * (m <= 15 ? 0.6 : m >= 45 ? 1.3 : 1)), 2, 14);
+    return clamp(Math.round(base * (m <= 15 ? 0.6 : m >= 45 ? 1.3 : 1)), 2, max || 14);
   }
   // 重任务日自动减量：完整模考/阅读/写作/翻译当天只背少量新词，把时间留给题型训练
   // 八天循环：听力 → 仔细阅读 → 选词填空 → 长篇匹配 → 写作 → 翻译 → 口语 → 完整模考
   function wordCountForCourse(c) {
+    if (examMode() === 'zx2') {
+      // 英语二大纲 4500 词：启蒙期约 7 词/天，词汇与题型期约 14 词/天，330 天覆盖 4500 词且不空转。
+      // 写作日、完整模考日按实际题型减量，减量日与八天循环严格对齐。
+      const base = c <= 45 ? 6 : (c <= 135 ? 14 : 12);
+      let factor = 1;
+      if (c > 90) {
+        const mode = (c - 91) % 8;
+        if (mode === 7) factor = 0.3;                                // 完整模考日
+        else if (mode === 6) factor = 0.6;                           // 写作日
+      }
+      return clamp(Math.round(dailyWordCount(base, 18) * factor), 2, 18);
+    }
+    if (examMode() === 'pets3') {
+      // PETS-3 大纲 4000 词：启蒙约 5 词/天，词汇期约 9 词/天，题型期约 8 词/天，476 天覆盖 4000 词。
+      // 口试/写作/完整模考日按八天循环减量，给听说读写专项腾时间。
+      const base = c <= 60 ? 5 : (c <= 180 ? 9 : 8);
+      let factor = 1;
+      if (c > 180) {
+        const mode = (c - 181) % 8;
+        if (mode === 7) factor = 0.3;                                // 完整模考日
+        else if (mode === 5 || mode === 6) factor = 0.6;             // 写作 / 口试日
+      }
+      return clamp(Math.round(dailyWordCount(base, 18) * factor), 2, 18);
+    }
     const base = c <= 44 ? 4 : (c <= 90 ? 6 : 12);
     let factor = 1;
     if (c > 90) {
@@ -123,16 +173,18 @@ const App = (function () {
     return clamp(Math.round(dailyWordCount(base) * factor), 2, 14);
   }
   // 连续累计词序：重任务日减量后仍按“实际新词数”推进，避免旧版按固定步长跳过整段单词
-  let wordStartCache = { minutes: null, starts: [] };
+  let wordStartCache = { key: null, starts: [] };
   function wordStartForCourse(c) {
     const m = state.minutes || 33;
-    if (wordStartCache.minutes !== m) {
+    const key = examMode() + ':' + m + ':' + totalDays();
+    if (wordStartCache.key !== key) {
       const starts = [];
+      const total = totalDays();
       starts[1] = 0;
-      for (let k = 1; k < SOURCE_DAYS; k++) starts[k + 1] = starts[k] + wordCountForCourse(k);
-      wordStartCache = { minutes: m, starts };
+      for (let k = 1; k < total; k++) starts[k + 1] = starts[k] + wordCountForCourse(k);
+      wordStartCache = { key, starts };
     }
-    return wordStartCache.starts[clamp(Math.floor(c || 1), 1, SOURCE_DAYS)] || 0;
+    return wordStartCache.starts[clamp(Math.floor(c || 1), 1, totalDays())] || 0;
   }
   // 环绕切片：词序走到词库末尾后从头继续，保证尾部单词也能进入当天任务
   function sliceCycle(src, start, count) {
@@ -157,7 +209,7 @@ const App = (function () {
       owed: [], misses: 0, lastGap: 0, lastPenaltyDate: null, comeback: null, comebackDone: 0,
       voiceURI: '', voiceFx: true, feedbackVoice: '', feedbackTone: 'funny', feedbackLang: 'zh',
       voiceProfile: null, naturalVoice: true,
-      level: 'zero', target: 'cet4', wrongBook: {}, writings: {}, translations: {}, transHistory: {},
+      level: 'zero', target: 'zx2', wrongBook: {}, writings: {}, translations: {}, transHistory: {},
       customAudio: { read: {}, feedback: {} }, videos: {}
     };
   }
@@ -171,7 +223,8 @@ const App = (function () {
     if (s.voiceURI === undefined) s.voiceURI = '';
     if (s.naturalVoice === undefined) s.naturalVoice = true;
     s.level = 'zero'; // 固定为只认识字母的起点；旧存档若曾选过其他水平，也统一回到真实起点
-    if (!s.target) s.target = 'cet4';
+    // 四级学习计划已暂停：旧存档若停在 cet4，自动回到默认英语二；四级工具仍可单独打开复习
+    if (s.target !== 'zx2' && s.target !== 'pets3') s.target = 'zx2';
     if (!s.wrongBook || typeof s.wrongBook !== 'object') s.wrongBook = {};
     if (!s.writings || typeof s.writings !== 'object') s.writings = {};
     if (!s.translations || typeof s.translations !== 'object') s.translations = {};
@@ -205,7 +258,7 @@ const App = (function () {
       const k = 'w:' + w;
       if (!s.srs[k]) {
         const t = (s.learnedWords[w] && s.learnedWords[w].t) || dateKey();
-        s.srs[k] = { last: t, due: addDays(t, REVIEW_INTERVALS[0]), stage: 0, ok: 0, bad: 0 };
+        s.srs[k] = { last: t, due: addDays(t, reviewIntervalsForMode(s.target)[0]), stage: 0, ok: 0, bad: 0 };
       }
     });
     // 升级兼容：旧版字母/音标复习 key 为 letter:N / phonetic:N，统一迁移为 l:N / p:N
@@ -270,11 +323,14 @@ const App = (function () {
   }
   function phaseOf(day) {
     const c = courseDay(day);
-    for (const p of PHASES) if (c >= p.days[0] && c <= p.days[1]) return p;
-    return c < 1 ? PHASES[0] : PHASES[3];
+    const list = examMode() === 'zx2' ? ZX2_PHASES : (examMode() === 'pets3' ? PETS3_PHASES : PHASES);
+    for (const p of list) if (c >= p.days[0] && c <= p.days[1]) return p;
+    return c < 1 ? list[0] : list[list.length - 1];
   }
   function wordLevel() {
     const d = courseDay();
+    if (examMode() === 'zx2') return d <= 45 ? 1 : d <= 135 ? 2 : d <= 275 ? 3 : 4;
+    if (examMode() === 'pets3') return d <= 60 ? 1 : d <= 180 ? 2 : d <= 380 ? 3 : 4;
     return d <= 90 ? 1 : d <= 365 ? 2 : d <= 547 ? 3 : 4;
   }
   function wordPool() {
@@ -288,7 +344,7 @@ const App = (function () {
     const k = kind + ':' + id;
     if (state.srs[k]) return;
     const t = when || dateKey();
-    state.srs[k] = { last: t, due: addDays(t, REVIEW_INTERVALS[0]), stage: 0, ok: 0, bad: 0 };
+    state.srs[k] = { last: t, due: addDays(t, reviewIntervals()[0]), stage: 0, ok: 0, bad: 0 };
     saveState();
   }
   function addDaysFromToday(n) { return addDays(dateKey(), n); }
@@ -324,16 +380,23 @@ const App = (function () {
   function applyReviewResults() {
     if (!ex || !ex.results) return;
     const today = dateKey();
+    const intervals = reviewIntervals();
+    const steps = reviewSteps();
     ex.results.forEach(r => {
       const item = state.srs[r.key];
       if (!item) return;
       if (r.ok) {
-        item.stage = Math.min((item.stage || 0) + 1, REVIEW_INTERVALS.length - 1);
+        // stage 表示“下一次该用哪个间隔”；走完 steps 次答对即毕业
+        const next = Math.min((item.stage || 0) + 1, steps);
+        item.stage = next;
         item.ok = (item.ok || 0) + 1;
-      } else { item.stage = 0; item.bad = (item.bad || 0) + 1; }
+        item.due = next >= steps ? null : addDays(today, intervals[next]);
+      } else {
+        item.stage = 0;
+        item.bad = (item.bad || 0) + 1;
+        item.due = addDays(today, intervals[0]);
+      }
       item.last = today;
-      // 完成全部间隔复习且答对即“毕业”，不再无限循环占用每日复习额度
-      item.due = r.ok && item.stage >= REVIEW_INTERVALS.length - 1 ? null : addDays(today, REVIEW_INTERVALS[item.stage]);
     });
     saveState();
   }
@@ -358,6 +421,178 @@ const App = (function () {
   // 启蒙期(课程日 1-90 ≈ 实际前 83 天)：字母音 → 音标 → 自然拼读，听力按辨音→辨标→辨词分级
   // 第 91 课程日起恢复原计划：语法 + 整句听力 / 阅读 / 口语 / 模考
   function planForDay(day) {
+    if (examMode() === 'zx2') return planZX2(day);
+    if (examMode() === 'pets3') return planPETS3(day);
+    return planCET4(day);
+  }
+
+  // ---------- 自考英语二（00015）课程表：四阶段 330 天 ----------
+  function planZX2(day) {
+    day = clamp(Math.floor(day || 1), 1, ZX2_DAYS);
+    const c = effectiveCourseDay(day);
+    const count = wordCountForCourse(c);
+    const pool = examWords();
+    const wStart = wordStartForCourse(c) % pool.length;
+    const words = sliceCycle(pool, wStart, count);
+
+    // 任务一：启蒙期字母音→音标→拼读；之后进入考试语法与词汇语法专项
+    let first;
+    if (c <= 6) {
+      const groups = [[0,1,2,3,4],[5,6,7,8,9],[10,11,12,13,14],[15,16,17,18,19],[20,21,22,23,24,25],[0,4,8,12,16,20,24]];
+      const idx = groups[c - 1];
+      first = { id:'a', icon:'🔤', name:'字母音学习', desc:'字母 '+idx.map(i=>LETTERS[i].letter).join('、')+' · 练它在单词里的发音', xp:20, mod:'letter', cfg:{ idx, soundMode:true } };
+    } else if (c <= 28) {
+      const from = (c - 7) * 2;
+      const idx = [from, from + 1];
+      first = { id:'a', icon:'🔤', name:'音标学习', desc:'音标 '+idx.map(i=>PHONETICS[i].sym).join(' / ')+' · 例词 '+idx.map(i=>PHONETICS[i].ex).join('、'), xp:20, mod:'phonetic', cfg:{ idx } };
+    } else if (c <= 45) {
+      const base = (c - 29) * 3;
+      const idx = [base % 44, (base+1) % 44, (base+2) % 44];
+      first = { id:'a', icon:'🔁', name:'音标巩固', desc:'再练音标 '+idx.map(i=>PHONETICS[i].sym).join(' / '), xp:20, mod:'phonetic', cfg:{ idx } };
+    } else if (c <= 90) {
+      const start = ((c - 46) * 2) % BLEND_LESSONS.length;
+      const idx = [start, (start+1) % BLEND_LESSONS.length];
+      first = { id:'a', icon:'🧩', name:'自然拼读', desc:'拼读 '+idx.map(i=>BLEND_LESSONS[i].parts.join('+')+'→'+BLEND_LESSONS[i].word).join('、'), xp:20, mod:'blend', cfg:{ idx } };
+    } else {
+      // 考试语法：按 GRAMMAR 顺序循环，覆盖时态/非谓语/从句/词性转换
+      const gi = (c - 91) % GRAMMAR.length;
+      first = { id:'a', icon:'🧩', name:'语法第 '+(gi+1)+' 讲', desc:GRAMMAR[gi].title+' · '+GRAMMAR[gi].point, xp:20, mod:'grammar', cfg:{ idx:gi } };
+    }
+
+    // 任务二：核心高频词，按实际新词数连续推进并环绕覆盖
+    const second = { id:'b', icon:'📖', name:'每日单词', xp:20, mod:'words',
+      desc:'第 '+(wStart+1)+' 词起：'+wordNames(words,3), cfg:{ start:wStart, count, src:'all' } };
+
+    // 任务三：启蒙期听力打底；词汇语法期起按英语二七大题型 + 模考八天循环
+    let third;
+    if (c <= 6) {
+      const base = (c - 1) * 4;
+      const idx = [base%26, (base+5)%26, (base+11)%26, (base+17)%26];
+      third = { id:'c', icon:'🎧', name:'听音辨字母', desc:'听例词，找出开头字母', xp:20, mod:'listening', cfg:{ kind:'letter', idx } };
+    } else if (c <= 28) {
+      const base = (c - 7) * 2;
+      const idx = [base%44, (base+1)%44, (base+5)%44, (base+11)%44];
+      third = { id:'c', icon:'🎧', name:'听音辨音标', desc:'听例词发音，选出对应音标', xp:20, mod:'phonetic', cfg:{ kind:'phonetic', idx } };
+    } else if (c <= 90) {
+      const wp = examWords();
+      const base = 55 + ((c - 45) * 4) % Math.max(1, wp.length - 55 - 4);
+      const idx = [base, base+1, base+2, base+3];
+      third = { id:'c', icon:'🎧', name:'听词选义', desc:'听单词发音，选出中文意思（打基础，英语二笔试不考听力）', xp:20, mod:'listening', cfg:{ kind:'word', idx } };
+    } else {
+      const mode = (c - 91) % 8;
+      const n = Math.max(0, Math.floor((c - 91 - mode) / 8));
+      const T = ZX2_TYPE_MODES[mode];
+      let item;
+      if (mode === 0) item = ZX2_JUDGE[n % ZX2_JUDGE.length];
+      else if (mode === 1) item = ZX2_READ[n % ZX2_READ.length];
+      else if (mode === 2) item = ZX2_SUMMARY[n % ZX2_SUMMARY.length];
+      else if (mode === 3) item = ZX2_GAPSENT[n % ZX2_GAPSENT.length];
+      else if (mode === 4) item = ZX2_GAPWORD[n % ZX2_GAPWORD.length];
+      else if (mode === 5) item = ZX2_CLOZE[n % ZX2_CLOZE.length];
+      else if (mode === 6) item = ZX2_WRITING[n % ZX2_WRITING.length];
+      else item = null;
+      const desc = mode === 7 ? '完整流程 · 7 大题型 · 按 100 分制估分'
+        : mode === 6 ? '《'+item.title+'》· 范文对照（30 分）'
+        : '《'+item.title+'》· '+escShort((item.qs || item.comps || item.ans || item.answers || []).length + ' 题', 40);
+      third = { id:'c', icon:T.icon, name:'英语二·'+T.name, desc:desc, xp:T.xp, mod:T.mod, cfg:{ seed:n + 1 } };
+    }
+
+    // 任务四：游戏与复习隔天交替（启蒙期聚焦已学高频词）
+    const gSrc = c <= 45 ? EASY_WORDS : examWords();
+    const gBase = c <= 45 ? ((c-1)*4) % gSrc.length : (c*5) % gSrc.length;
+    const gWords = sliceCycle(gSrc, gBase, 5);
+    const gKey = gSrc === EASY_WORDS ? 'easy' : 'all';
+    const fourth = c % 2 === 0
+      ? { id:'d', icon:'🎮', name:'单词配对游戏', desc:'第 '+(gBase+1)+' 词起配对：'+wordNames(gWords,2), xp:15, mod:'game', cfg:{ start:gBase, count:5, src:gKey } }
+      : { id:'d', icon:'🔁', name:'复习巩固', desc:'复习第 '+(gBase+1)+' 词起：'+wordNames(gWords,2), xp:15, mod:'review', cfg:{ start:gBase, count:5, src:gKey } };
+
+    return [first, second, third, fourth];
+  }
+
+  // ---------- 全国英语等级考试 PETS-3（2028 年 3 月）课程表：四阶段 476 天 ----------
+  function planPETS3(day) {
+    day = clamp(Math.floor(day || 1), 1, PETS3_DAYS);
+    const c = effectiveCourseDay(day);
+    const count = wordCountForCourse(c);
+    const pool = examWords();
+    const wStart = wordStartForCourse(c) % pool.length;
+    const words = sliceCycle(pool, wStart, count);
+
+    // 任务一：与英语二共用零基础启蒙，之后进入PETS-3所需考试语法
+    let first;
+    if (c <= 6) {
+      const groups = [[0,1,2,3,4],[5,6,7,8,9],[10,11,12,13,14],[15,16,17,18,19],[20,21,22,23,24,25],[0,4,8,12,16,20,24]];
+      const idx = groups[c - 1];
+      first = { id:'a', icon:'🔤', name:'字母音学习', desc:'字母 '+idx.map(i=>LETTERS[i].letter).join('、')+' · 练它在单词里的发音', xp:20, mod:'letter', cfg:{ idx, soundMode:true } };
+    } else if (c <= 28) {
+      const from = (c - 7) * 2;
+      const idx = [from, from + 1];
+      first = { id:'a', icon:'🔤', name:'音标学习', desc:'音标 '+idx.map(i=>PHONETICS[i].sym).join(' / ')+' · 例词 '+idx.map(i=>PHONETICS[i].ex).join('、'), xp:20, mod:'phonetic', cfg:{ idx } };
+    } else if (c <= 45) {
+      const base = (c - 29) * 3;
+      const idx = [base % 44, (base+1) % 44, (base+2) % 44];
+      first = { id:'a', icon:'🔁', name:'音标巩固', desc:'再练音标 '+idx.map(i=>PHONETICS[i].sym).join(' / '), xp:20, mod:'phonetic', cfg:{ idx } };
+    } else if (c <= 90) {
+      const start = ((c - 46) * 2) % BLEND_LESSONS.length;
+      const idx = [start, (start+1) % BLEND_LESSONS.length];
+      first = { id:'a', icon:'🧩', name:'自然拼读', desc:'拼读 '+idx.map(i=>BLEND_LESSONS[i].parts.join('+')+'→'+BLEND_LESSONS[i].word).join('、'), xp:20, mod:'blend', cfg:{ idx } };
+    } else {
+      const gi = (c - 91) % GRAMMAR.length;
+      first = { id:'a', icon:'🧩', name:'语法第 '+(gi+1)+' 讲', desc:GRAMMAR[gi].title+' · '+GRAMMAR[gi].point, xp:20, mod:'grammar', cfg:{ idx:gi } };
+    }
+
+    const second = { id:'b', icon:'📖', name:'每日单词', xp:20, mod:'words',
+      desc:'第 '+(wStart+1)+' 词起：'+wordNames(words,3), cfg:{ start:wStart, count, src:'all' } };
+
+    // 任务三：启蒙期听力打底；词汇语法期起按 PETS-3 笔试四部分 + 口试 + 模考八天循环
+    let third;
+    if (c <= 6) {
+      const base = (c - 1) * 4;
+      const idx = [base%26, (base+5)%26, (base+11)%26, (base+17)%26];
+      third = { id:'c', icon:'🎧', name:'听音辨字母', desc:'听例词，找出开头字母', xp:20, mod:'listening', cfg:{ kind:'letter', idx } };
+    } else if (c <= 28) {
+      const base = (c - 7) * 2;
+      const idx = [base%44, (base+1)%44, (base+5)%44, (base+11)%44];
+      third = { id:'c', icon:'🎧', name:'听音辨音标', desc:'听例词发音，选出对应音标', xp:20, mod:'phonetic', cfg:{ kind:'phonetic', idx } };
+    } else if (c <= 90) {
+      const wp = examWords();
+      const base = 55 + ((c - 45) * 4) % Math.max(1, wp.length - 55 - 4);
+      const idx = [base, base+1, base+2, base+3];
+      third = { id:'c', icon:'🎧', name:'听词选义', desc:'听单词发音，选出中文意思（PETS-3 笔试听力打底）', xp:20, mod:'listening', cfg:{ kind:'word', idx } };
+    } else {
+      const mode = (c - 91) % 8;
+      const n = Math.max(0, Math.floor((c - 91 - mode) / 8));
+      const T = PETS3_TYPE_MODES[mode];
+      let item;
+      if (mode === 0) item = PETS3_LISTENING[n % PETS3_LISTENING.length];
+      else if (mode === 1) item = PETS3_USE[n % PETS3_USE.length];
+      else if (mode === 2) item = PETS3_READ[n % PETS3_READ.length];
+      else if (mode === 3) item = PETS3_MATCH[n % PETS3_MATCH.length];
+      else if (mode === 4) item = PETS3_ERROR[n % PETS3_ERROR.length];
+      else if (mode === 5) item = PETS3_WRITING[n % PETS3_WRITING.length];
+      else if (mode === 6) item = PETS3_SPEAK[n % PETS3_SPEAK.length];
+      else item = null;
+      const cntText = mode === 7 ? '4 部分笔试 + 口试模拟'
+        : mode === 5 ? escShort(item.prompt || item.title, 40)
+        : mode === 6 ? escShort(item.q || item.title, 40)
+        : '《'+item.title+'》· '+escShort((item.qs || item.statements || item.errors || []).length + ' 题', 40);
+      third = { id:'c', icon:T.icon, name:'PETS-3·'+T.name, desc:cntText, xp:T.xp, mod:T.mod, cfg:{ seed:n + 1 } };
+    }
+
+    const gSrc = c <= 60 ? EASY_WORDS : examWords();
+    const gBase = c <= 60 ? ((c-1)*4) % gSrc.length : (c*5) % gSrc.length;
+    const gWords = sliceCycle(gSrc, gBase, 5);
+    const gKey = gSrc === EASY_WORDS ? 'easy' : 'all';
+    const fourth = c % 2 === 0
+      ? { id:'d', icon:'🎮', name:'单词配对游戏', desc:'第 '+(gBase+1)+' 词起配对：'+wordNames(gWords,2), xp:15, mod:'game', cfg:{ start:gBase, count:5, src:gKey } }
+      : { id:'d', icon:'🔁', name:'复习巩固', desc:'复习第 '+(gBase+1)+' 词起：'+wordNames(gWords,2), xp:15, mod:'review', cfg:{ start:gBase, count:5, src:gKey } };
+
+    return [first, second, third, fourth];
+  }
+  function escShort(s, n) { return String(s).length > n ? String(s).slice(0, n) + '…' : String(s); }
+
+  // ---------- 四级完整课程表（计划已暂停，工具与回归保留） ----------
+  function planCET4(day) {
     day = clamp(Math.floor(day || 1), 1, totalDays());
     const c = effectiveCourseDay(courseDay(day));
     const phase = phaseOf(day);
@@ -479,11 +714,14 @@ const App = (function () {
     if (!t) return 0;
     const m = t.mod;
     const cfg = t.cfg || {};
-    if (m === 'mockFull') return 25;
+    if (m === 'mockFull' || m === 'zx2Mock' || m === 'pets3Mock') return 25;
     if (m === 'cenReading') return 8;
-    if (m === 'writing') return 12;
+    if (m === 'zx2Judge' || m === 'zx2Read' || m === 'zx2Summary' || m === 'pets3Listening') return 8;
+    if (m === 'zx2GapSent' || m === 'zx2Cloze' || m === 'pets3Error') return 6;
+    if (m === 'zx2GapWord' || m === 'pets3Use' || m === 'pets3Read' || m === 'pets3Match') return 7;
+    if (m === 'writing' || m === 'zx2Writing' || m === 'pets3Writing') return 12;
     if (m === 'translation') return 10;
-    if (m === 'cenListening' || m === 'speaking') return 5;
+    if (m === 'cenListening' || m === 'speaking' || m === 'pets3Speaking') return 5;
     if (m === 'dueReview') return Math.min(9, 0.3 * ((cfg.keys || []).length || 5));
     if (m === 'words') return 0.5 * (cfg.count || 6);
     if (m === 'letter' || m === 'phonetic' || m === 'blend') return 0.6 * ((cfg.idx || []).length || 2);
@@ -1045,14 +1283,22 @@ const App = (function () {
     const percent = clamp(Math.round(doneCount / tasks.length * 100), 0, 100);
     const overall = clamp(Math.round(day / totalDays() * 100), 0, 100);
     const greet = new Date().getHours() < 12 ? '早上好' : new Date().getHours() < 18 ? '下午好' : '晚上好';
+    const mode = examMode();
+    const isZX2 = mode === 'zx2';
+    const isPETS3 = mode === 'pets3';
+    const examDate = isZX2 ? ZX2_EXAM_DATE : (isPETS3 ? PETS3_EXAM_DATE : null);
+    const countdown = examDate ? Math.max(0, daysBetween(dateKey(), examDate)) : null;
+    const examName = isZX2 ? '英语二' : (isPETS3 ? 'PETS-3' : '');
+    const examTitle = isZX2 ? '英语二 60 分，稳稳拿下！' : (isPETS3 ? 'PETS-3 笔试 60 分，稳稳拿下！' : '今天也要元气满满地学英语！');
     el.innerHTML =
       '<div class="hero">' +
         '<div class="hello">' + greet + '，学习者 👋 · 第 ' + day + ' 天 / 共 ' + totalDays() + ' 天</div>' +
-        '<h1>' + (day >= totalDays() ? '恭喜你完成旅程！🎓' : '今天也要元气满满地学英语！') + '</h1>' +
+        '<h1>' + (day >= totalDays() ? '恭喜你完成旅程！🎓' : examTitle) + '</h1>' +
         '<p>当前阶段：' + phase.name + ' · ' + phase.goal + '</p>' +
+        (examDate ? '<p class="countdown">🎯 距 ' + examDate + ' ' + examName + '考试还有 <b>' + countdown + '</b> 天 · 目标 60 分及格' + (isPETS3 ? '（日期暂定，官方公布后可调整）' : '') + '</p>' : '') +
         '<div class="quote">✨ ' + esc(quote) + '</div>' +
         '<div class="hero-rocket">🚀</div>' +
-        '<div class="progress-wrap"><div class="progress-meta"><span>总旅程进度</span><span>' + overall + '% · 还剩 ' + Math.max(0, totalDays() - day) + ' 天</span></div><div class="progress"><i style="width:' + overall + '%"></i></div></div>' +
+        '<div class="progress-wrap"><div class="progress-meta"><span>' + (examDate ? '备考进度' : '总旅程进度') + '</span><span>' + overall + '% · 还剩 ' + Math.max(0, totalDays() - day) + ' 天</span></div><div class="progress"><i style="width:' + overall + '%"></i></div></div>' +
       '</div>' +
       (state.owed.length ? '<div class="timeline-note" style="margin-top:14px"><span style="font-size:20px">🧾</span><div><b>断签欠账：还有 ' + state.owed.length + ' 天没补</b><br>今天计划末尾已加入补做任务，做完才能拿全勤奖励。最多补 2 天，更早的自动翻篇，不用背着包袱。</div></div>' : '') +
 
@@ -1100,6 +1346,26 @@ const App = (function () {
     return f.name;
   }
   function renderLearn() {
+    const zx2mods = [
+      ['zx2Judge', '✅', '阅读判断', '10 分题型 · 6 篇短文判正误', 'm-reading'],
+      ['zx2Read', '📚', '阅读选择', '10 分题型 · 读短文选答案', 'm-reading'],
+      ['zx2Summary', '📝', '概括补全', '10 分题型 · 段落大意+补全句', 'm-reading'],
+      ['zx2GapSent', '🧩', '填句补文', '10 分题型 · 选句填空缺', 'm-reading'],
+      ['zx2GapWord', '🔤', '填词补文', '15 分题型 · 从词库选词', 'm-reading'],
+      ['zx2Cloze', '✏️', '完形补文', '15 分题型 · 词的正确形式', 'm-grammar'],
+      ['zx2Writing', '✍️', '英语二写作', '30 分题型 · 12 话题+范文', 'm-reading'],
+      ['zx2Mock', '📋', '英语二真题模考', '完整流程 · 100 分制估分', 'm-game']
+    ];
+    const pets3mods = [
+      ['pets3Listening', '🎧', 'PETS-3 听力', '对话/短文 · 25 题权重 30%', 'm-listening'],
+      ['pets3Use', '🔤', 'PETS-3 知识运用', '完形填空 · 词汇语法综合', 'm-grammar'],
+      ['pets3Reading', '📚', 'PETS-3 阅读', '多项选择 · 30% 分值', 'm-reading'],
+      ['pets3Match', '🧩', 'PETS-3 阅读配伍', '段落与标题匹配训练', 'm-reading'],
+      ['pets3Error', '✏️', 'PETS-3 短文改错', '识别并改正常见错误', 'm-grammar'],
+      ['pets3Writing', '✍️', 'PETS-3 写作', '书信/情景作文 · 范文+词组', 'm-reading'],
+      ['pets3Speaking', '🎤', 'PETS-3 口试', '12 话题 · 参考回答+中文', 'm-speaking'],
+      ['pets3Mock', '📝', 'PETS-3 完整模考', '四部分笔试 + 口试模拟', 'm-game']
+    ];
     const mods = [
       ['archive', '🗂️', '我的学习档案', '学过全汇总，随时查和复习', 'm-review'],
       ['write', '✍️', '手写练习板', '描红书写，记牢拼写', 'm-reading'],
@@ -1125,13 +1391,19 @@ const App = (function () {
       ['review', '🔁', '复习巩固', '对抗遗忘，牢记单词', 'm-review'],
       ['mock', '📝', '四级模考', '综合训练，检验成果', 'm-game']
     ];
+    const isZX2 = examMode() === 'zx2';
+    const isPETS3 = examMode() === 'pets3';
+    const cardHtml = m => '<button class="module-card ' + m[4] + '" data-mod="' + m[0] + '"><div class="m-ic">' + m[1] + '</div><h3>' + m[2] + '</h3><p>' + m[3] + '</p></button>';
     $('#view-learn').innerHTML =
       '<div class="section-title" style="margin-top:4px"><h2>🎒 自由练习区</h2><span class="hint">今天的必做任务在首页，含自动复习</span></div>' +
-      '<div class="timeline-note" style="margin-bottom:14px"><span style="font-size:20px">📌</span><div>这里是可以随时加练的工具箱。每天<u>必做</u>的任务请到「今日」页面完成：四项固定内容按第 ' + (state.dayIndex || 1) + ' 天排好，另有系统按遗忘曲线算出的到期复习，不需要自己挑。</div></div>' +
-      '<div class="module-grid">' + mods.map(m =>
-        '<button class="module-card ' + m[4] + '" data-mod="' + m[0] + '"><div class="m-ic">' + m[1] + '</div><h3>' + m[2] + '</h3><p>' + m[3] + '</p></button>'
-      ).join('') + '</div>' +
-      '<div class="card" style="margin-top:18px"><h3>💡 高效学习小贴士</h3><p class="muted">① 先听发音再记拼写，声音比文字更好记；② 每张卡片主动回忆后再翻开；③ 每天睡前用 3 分钟复盘当天单词；④ 不要怕犯错，错题记得越牢。</p></div>';
+      '<div class="timeline-note" style="margin-bottom:14px"><span style="font-size:20px">📌</span><div>这里是可以随时加练的工具箱。每天<u>必做</u>的任务请到「今日」页面完成：四项固定内容按第 ' + (state.dayIndex || 1) + ' 天排好，另有系统按遗忘曲线算出的到期复习，不需要自己挑。英语二与 PETS-3 专项都可随时复习，当前备考目标：' + (isPETS3 ? 'PETS-3' : (isZX2 ? '英语二' : '四级（已暂停）')) + '。</div></div>' +
+      '<div class="section-title"><h2>🎓 自考英语二专项</h2><span class="hint">七大题型 · 满分 100 · 60 分及格' + (isZX2 ? ' · 当前目标' : '') + '</span></div>' +
+      '<div class="module-grid">' + zx2mods.map(cardHtml).join('') + '</div>' +
+      '<div class="section-title" style="margin-top:18px"><h2>🅿️ PETS-3 专项</h2><span class="hint">笔试四部分 + 口试 · 满分 100 · 60 分及格' + (isPETS3 ? ' · 当前目标' : '') + '</span></div>' +
+      '<div class="module-grid">' + pets3mods.map(cardHtml).join('') + '</div>' +
+      '<div class="section-title" style="margin-top:18px"><h2>🛠️ 全部学习工具</h2><span class="hint">打基础 + 英语二 / PETS-3 / 四级工具都保留</span></div>' +
+      '<div class="module-grid">' + mods.map(cardHtml).join('') + '</div>' +
+      '<div class="card" style="margin-top:18px"><h3>💡 高效学习小贴士</h3><p class="muted">① 先听发音再记拼写，声音比文字更好记；② 每张卡片主动回忆后再翻开；③ 每天睡前用 3 分钟复盘当天单词；④ 写作字数够、结构清楚就能拿基础分；⑤ 英语二与 PETS-3 词库互通，切换目标只是换题型和倒计时。</p></div>';
   }
   /* ---------- 我的学习档案：按已学天数汇总单词/音标/字母/拼读/语法/句子 ---------- */
   let archiveState = { cat: 'w', q: '', scope: 'learned' };
@@ -1151,50 +1423,104 @@ const App = (function () {
       seen[cat][key] = true;
       data[cat].push(item);
     }
-    // 遍历已学的每个课程日，从固定课程表收集
+    // PETS-3 题型内容入档案：与每日任务题目同源（按 seed 选篇），保证学过的文章/范文都能复习、能导出
+    function addPETS3Archive(mod, seed, day) {
+      const n = (seed - 1);
+      function pick(bank) { return bank && bank.length ? bank[((n % bank.length) + bank.length) % bank.length] : null; }
+      function pushSentence(key, main, sub, cn, audio, kind) {
+        add('s', key, { key:key, main:main, sub:sub, cn:cn || '', audio:audio || main.slice(0,180), day:day, kind:kind });
+      }
+      if (mod === 'pets3Listening') {
+        const it = pick(PETS3_LISTENING);
+        if (!it) return;
+        (it.qs || []).forEach((q, i) => {
+          if (q.audio) pushSentence('P3L'+it.id+':'+i, q.audio, 'PETS-3 听力原文《'+(it.title||'')+'》· '+q.q, q.why, q.audio, 'PETS-3听力');
+        });
+      } else if (mod === 'pets3Use') {
+        const it = pick(PETS3_USE);
+        if (it && it.text) pushSentence('P3U'+it.id, it.text, 'PETS-3 英语知识运用《'+(it.title||'')+'》', (it.keys||[]).join(' / '), it.text.slice(0,180), 'PETS-3完形');
+      } else if (mod === 'pets3Reading') {
+        const it = pick(PETS3_READ);
+        if (it && it.text) pushSentence('P3R'+it.id, it.text, 'PETS-3 阅读理解《'+(it.title||'')+'》', '', it.text.slice(0,180), 'PETS-3阅读');
+      } else if (mod === 'pets3Match') {
+        const it = pick(PETS3_MATCH);
+        if (it) {
+          const txt = Array.isArray(it.text) ? it.text.join('\n') : (it.text || '');
+          if (txt) pushSentence('P3M'+it.id, txt, 'PETS-3 阅读配伍《'+(it.title||'')+'》', (it.options||[]).join(' / '), txt.slice(0,180), 'PETS-3配伍');
+        }
+      } else if (mod === 'pets3Error') {
+        const it = pick(PETS3_ERROR);
+        if (it && it.lines) pushSentence('P3E'+it.id, it.lines.join('\n'), 'PETS-3 短文改错《'+(it.title||'')+'》', (it.errors||[]).map(e=>e.wrong+'→'+e.opts[e.ans]).join('；'), it.lines[0]||'', 'PETS-3改错');
+      } else if (mod === 'pets3Writing') {
+        const W = pick(PETS3_WRITING);
+        if (W) pushSentence('P3W'+W.id, W.model, 'PETS-3 写作范文《'+(W.title||'')+'》', W.modelCn, W.model, 'PETS-3作文');
+      } else if (mod === 'pets3Speaking') {
+        const S = pick(PETS3_SPEAK);
+        if (S) pushSentence('P3S'+S.id, S.model, 'PETS-3 口试参考《'+(S.title||'')+'》· '+(S.q||''), S.modelCn, S.model, 'PETS-3口试');
+      } else if (mod === 'pets3Mock' && typeof window.makePETS3Mock === 'function') {
+        const mp = window.makePETS3Mock(seed);
+        if (!mp) return;
+        [['listening',mp.listening,'听力'],['use',mp.use,'英语知识运用'],['read',mp.read,'阅读'],['match',mp.match,'阅读配伍'],['error',mp.error,'短文改错']].forEach(pair => {
+          const k = pair[0], it = pair[1], nm = pair[2];
+          if (!it) return;
+          let txt = '';
+          if (k === 'listening') txt = (it.qs||[]).map(q=>q.audio||'').filter(Boolean).join('\n');
+          else if (k === 'use' || k === 'read') txt = it.text || '';
+          else if (k === 'match') txt = Array.isArray(it.text) ? it.text.join('\n') : (it.text || '');
+          else if (k === 'error') txt = (it.lines||[]).join('\n');
+          if (txt) pushSentence('P3Mock'+k+(it.id||''), txt, 'PETS-3 完整模考·'+nm+'《'+(it.title||'')+'》', '', txt.slice(0,180), 'PETS-3模考');
+        });
+        if (mp.writing) pushSentence('P3MockW'+(mp.writing.id||''), mp.writing.model, 'PETS-3 完整模考·写作《'+(mp.writing.title||'')+'》', mp.writing.modelCn, mp.writing.model, 'PETS-3模考');
+        if (mp.speaking) pushSentence('P3MockS'+(mp.speaking.id||''), mp.speaking.model, 'PETS-3 完整模考·口试《'+(mp.speaking.title||'')+'》', mp.speaking.modelCn, mp.speaking.model, 'PETS-3模考');
+      }
+    }
+    // 遍历已学的每个课程日，直接用当天课程表任务收集，英语二/PETS-3/四级都准确
     courseDaysLearned().forEach(c0 => {
       const c = effectiveCourseDay(c0);
+      const tasks = planForDay(c0);
+      const t1 = tasks[0] || {}, t2 = tasks[1] || {}, t3 = tasks[2] || {};
+      const C1 = t1.cfg || {}, C2 = t2.cfg || {}, C3 = t3.cfg || {};
       // 任务一：字母 / 音标 / 拼读 / 语法
-      if (c <= 6) {
-        const groups = [[0,1,2,3,4],[5,6,7,8,9],[10,11,12,13,14],[15,16,17,18,19],[20,21,22,23,24,25],[0,4,8,12,16,20,24]];
-        (groups[c-1]||[]).forEach(i => { const L = LETTERS[i]; if (L) add('l', 'L'+i, { key:'L'+i, main:L.letter, sub:'字母音 '+L.sound+' · 例词 '+L.soundEx+' '+L.soundCn, ph:L.sound, cn:L.soundCn, audio:L.soundEx, tip:L.tip, day:c, kind:'字母音' }); });
-      } else if (c <= 28) {
-        const from = (c-7)*2;
-        [from, from+1].forEach(i => { const P = PHONETICS[i]; if (P) add('p', 'P'+i, { key:'P'+i, main:P.sym, sub:P.type+' · 例词 '+P.ex+' '+P.cn, ph:P.sym, cn:P.cn, audio:P.ex, day:c, kind:'音标' }); });
-      } else if (c <= 44) {
-        const base = (c-29)*3;
-        [base%44,(base+1)%44,(base+2)%44].forEach(i => { const P = PHONETICS[i]; if (P) add('p', 'P'+i, { key:'P'+i, main:P.sym, sub:P.type+' · 例词 '+P.ex+' '+P.cn, ph:P.sym, cn:P.cn, audio:P.ex, day:c, kind:'音标' }); });
-      } else if (c <= 90) {
-        const start = ((c-45)*2) % BLEND_LESSONS.length;
-        [start,(start+1)%BLEND_LESSONS.length].forEach(i => { const B = BLEND_LESSONS[i%BLEND_LESSONS.length]; if (B) add('b', 'B'+i, { key:'B'+i, main:B.word, sub:'拼读 '+B.parts.join(' + ')+' → '+B.cn, ph:B.parts.map(x=>'/'+x+'/').join(' '), cn:B.cn, audio:B.word, day:c, kind:'自然拼读' }); });
-      } else {
-        const gi = (c-91) % GRAMMAR.length;
-        const G = GRAMMAR[gi];
-        if (G) add('g', 'G'+gi, { key:'G'+gi, main:G.title, sub:G.point, ex:G.ex, cn:G.cn, audio:G.ex, day:c, kind:'语法' });
+      if (t1.mod === 'letter') {
+        (C1.idx || []).forEach(i => { const L = LETTERS[i]; if (L) add('l', 'L'+i, { key:'L'+i, main:L.letter, sub:'字母音 '+L.sound+' · 例词 '+L.soundEx+' '+L.soundCn, ph:L.sound, cn:L.soundCn, audio:L.soundEx, tip:L.tip, day:c, kind:'字母音' }); });
+      } else if (t1.mod === 'phonetic') {
+        (C1.idx || []).forEach(i => { const P = PHONETICS[i]; if (P) add('p', 'P'+i, { key:'P'+i, main:P.sym, sub:P.type+' · 例词 '+P.ex+' '+P.cn, ph:P.sym, cn:P.cn, audio:P.ex, day:c, kind:'音标' }); });
+      } else if (t1.mod === 'blend') {
+        (C1.idx || []).forEach(i => { const B = BLEND_LESSONS[i%BLEND_LESSONS.length]; if (B) add('b', 'B'+i, { key:'B'+i, main:B.word, sub:'拼读 '+B.parts.join(' + ')+' → '+B.cn, ph:B.parts.map(x=>'/'+x+'/').join(' '), cn:B.cn, audio:B.word, day:c, kind:'自然拼读' }); });
+      } else if (t1.mod === 'grammar') {
+        const G = GRAMMAR[C1.idx]; if (G) add('g', 'G'+C1.idx, { key:'G'+C1.idx, main:G.title, sub:G.point, ex:G.ex, cn:G.cn, audio:G.ex, day:c, kind:'语法' });
       }
-      // 任务二：每日单词
-      let wSrc, wCount, wStart;
-      if (c <= 44) { wSrc = EASY_WORDS; wCount = wordCountForCourse(c); wStart = ((c-1)*4) % Math.max(1, EASY_WORDS.length-wCount); }
-      else if (c <= 90) { wSrc = ALL_WORDS; wCount = wordCountForCourse(c); wStart = 55 + ((c-45)*6) % Math.max(1, ALL_WORDS.length-55-wCount); }
-      else { wSrc = ALL_WORDS; wCount = wordCountForCourse(c); wStart = ((c-91)*10) % Math.max(1, ALL_WORDS.length-wCount); }
-      wSrc.slice(wStart, wStart+wCount).forEach(w => { if (w && w.w) add('w', w.w, { key:w.w, main:w.w, sub:w.ex || '', ph:w.ph || '', cn:w.cn || '', cnEx:w.cnEx || '', audio:w.w, day:c, kind:'单词' }); });
-      // 任务三：听力句子 / 口语话题 / 阅读短文
-      if (c > 90) {
-        const mode = (c-1)%4;
-        if (mode === 0 || mode === 3) {
-          const li = (mode===0 ? (c*2) : (c*3)) % LISTEN_BANK.length;
-          [li,(li+7)%LISTEN_BANK.length].forEach(i => { const S = LISTEN_BANK[i]; if (S) add('s', 'S'+i, { key:'S'+i, main:S[0], sub:'听力句型', cn:S[1], audio:S[0], day:c, kind:'句子' }); });
-        } else if (mode === 1) {
-          const ph = phaseOf(c);
-          const pool = PASSAGES.filter(x => x.lvl <= Math.min(4, ph.id));
-          const pi = c % Math.max(1,pool.length);
-          const P = pool[pi];
-          if (P) add('s', 'P'+P.title, { key:'P'+P.title, main:P.text, sub:'短文《'+P.title+'》', cn:P.cn, audio:P.text, day:c, kind:'短文' });
-        } else if (mode === 2) {
-          const ti = (c-1) % SPEAK_TOPICS.length;
-          const T = SPEAK_TOPICS[ti];
-          if (T) add('s', 'T'+ti, { key:'T'+ti, main:T.sample, sub:'口语：'+T.q, cn:T.cn, audio:T.sample, day:c, kind:'口语句' });
-        }
+      // 任务二：每日单词（按任务实际段位，环绕切片）
+      if (t2.mod === 'words' && C2.start != null) {
+        const wSrc = C2.src === 'easy' ? EASY_WORDS : examWords();
+        sliceCycle(wSrc, C2.start, C2.count).forEach(w => { if (w && w.w) add('w', w.w, { key:w.w, main:w.w, sub:w.ex || '', ph:w.ph || '', cn:w.cn || '', cnEx:w.cnEx || '', audio:w.w, day:c, kind:'单词' }); });
+      }
+      // 任务三：听力句子 / 口语话题 / 阅读短文 / 英语二题型文章
+      if (t3.mod === 'listening' && (C3.kind === 'word' || !C3.kind)) {
+        (C3.idx || []).forEach(i => { const wp = examWords(); const w = wp[i%wp.length]; if (w) add('s', 'L'+i, { key:'L'+i, main:w.ex || w.w, sub:'听词选义：'+w.w, cn:w.cn || '', audio:w.w, day:c, kind:'听力句' }); });
+      } else if (t3.mod === 'listening' && C3.kind === 'letter') {
+        (C3.idx || []).forEach(i => { const L = LETTERS[i%LETTERS.length]; if (L) add('s', 'SL'+i, { key:'SL'+i, main:L.soundEx, sub:'听音辨字母：'+L.letter, cn:L.soundCn, audio:L.soundEx, day:c, kind:'听力句' }); });
+      } else if (t3.mod === 'speaking') {
+        const T = SPEAK_TOPICS[(C3.idx || 0) % SPEAK_TOPICS.length];
+        if (T) add('s', 'T'+(C3.idx||0), { key:'T'+(C3.idx||0), main:T.sample, sub:'口语：'+T.q, cn:T.cn, audio:T.sample, day:c, kind:'口语句' });
+      } else if (t3.mod === 'cenReading' || t3.mod === 'zx2Judge' || t3.mod === 'zx2Read' || t3.mod === 'zx2Summary' || t3.mod === 'zx2GapSent' || t3.mod === 'zx2GapWord' || t3.mod === 'zx2Cloze') {
+        const seed = C3.seed || 1;
+        let item = null;
+        if (t3.mod === 'cenReading') item = CET4_CAREFUL[seed % CET4_CAREFUL.length];
+        else if (t3.mod === 'zx2Judge') item = ZX2_JUDGE[(seed-1) % ZX2_JUDGE.length];
+        else if (t3.mod === 'zx2Read') item = ZX2_READ[(seed-1) % ZX2_READ.length];
+        else if (t3.mod === 'zx2Summary') item = ZX2_SUMMARY[(seed-1) % ZX2_SUMMARY.length];
+        else if (t3.mod === 'zx2GapSent') item = ZX2_GAPSENT[(seed-1) % ZX2_GAPSENT.length];
+        else if (t3.mod === 'zx2GapWord') item = ZX2_GAPWORD[(seed-1) % ZX2_GAPWORD.length];
+        else if (t3.mod === 'zx2Cloze') item = ZX2_CLOZE[(seed-1) % ZX2_CLOZE.length];
+        if (item && item.text) add('s', 'A'+t3.mod+(item.id||''), { key:'A'+t3.mod+(item.id||''), main:item.text, sub:'《'+(item.title||'短文')+'》· '+t3.name, cn:'', audio:item.text.slice(0,180), day:c, kind:'题型短文' });
+        if (item && item.paras) add('s', 'A'+t3.mod+(item.id||''), { key:'A'+t3.mod+(item.id||''), main:item.paras.join('\n'), sub:'《'+(item.title||'短文')+'》· '+t3.name, cn:'', audio:item.paras[0], day:c, kind:'题型短文' });
+      } else if (t3.mod === 'zx2Writing') {
+        const seed = C3.seed || 1;
+        const W = ZX2_WRITING[(seed-1) % ZX2_WRITING.length];
+        if (W) add('s', 'ZW'+W.id, { key:'ZW'+W.id, main:W.model, sub:'英语二写作范文《'+W.title+'》', cn:W.modelCn, audio:W.model, day:c, kind:'作文' });
+      } else if (t3.mod === 'pets3Listening' || t3.mod === 'pets3Use' || t3.mod === 'pets3Reading' || t3.mod === 'pets3Match' || t3.mod === 'pets3Error' || t3.mod === 'pets3Writing' || t3.mod === 'pets3Speaking' || t3.mod === 'pets3Mock') {
+        addPETS3Archive(t3.mod, C3.seed || 1, c);
       }
     });
     // 补充：口语对话场景（按已解锁档位的全部句子）
@@ -1343,7 +1669,93 @@ const App = (function () {
   }
   function goArchive() { renderArchive(); go('archive'); }
 
+  function renderPlanZX2() {
+    const day = state.dayIndex;
+    const total = ZX2_DAYS;
+    const phases = ZX2_PHASES.map(p => {
+      const cur = p.id === phaseOf().id;
+      const pct = clamp(Math.round((day - p.days[0] + 1) / (p.days[1] - p.days[0] + 1) * 100), 0, 100);
+      return '<div class="phase-card ' + p.color + (cur ? ' current' : '') + '">' +
+        '<div class="phase-top"><h3>第 ' + p.id + ' 阶段 · ' + p.name + (cur ? ' <span class="badge purple">进行中</span>' : '') + '</h3>' +
+        '<span class="muted">第 ' + p.days[0] + ' – ' + p.days[1] + ' 天</span></div>' +
+        '<div class="phase-goal">🎯 ' + esc(p.goal) + '</div>' +
+        '<div class="phase-desc">' + esc(p.desc) + '</div>' +
+        '<div class="tag-row">' + p.focus.map(f => '<span class="tag">' + esc(f) + '</span>').join('') + '</div>' +
+        '<div class="progress" style="background:#EEF0F7;margin-top:12px"><i style="width:' + pct + '%"></i></div></div>';
+    }).join('');
+    const upcoming = Array.from({ length: 7 }, (_, i) => Math.max(1, day || 1) + i).map(n => {
+      const t = dailyTasks(n);
+      return '<div class="card" style="margin-bottom:10px;box-shadow:none">' +
+        '<div class="phase-top"><h3>第 ' + n + ' 天' + (n === day ? ' <span class="badge purple">今天</span>' : '') + '</h3><span class="muted">' + phaseOf(n).name + ' · ' + t.length + ' 项 · 约 ' + planMinutes(n) + ' 分钟</span></div>' +
+        '<div class="tag-row">' + t.map(x => '<span class="tag">' + x.icon + ' ' + esc(x.name) + '：' + esc(x.desc.length > 26 ? x.desc.slice(0, 26) + '…' : x.desc) + '</span>').join('') + '</div></div>';
+    }).join('');
+    const templates = [
+      '第 1–6 天字母音 → 第 7–28 天每天 2 个音标 → 第 29–45 天音标巩固 → 第 46–90 天自然拼读；每天配 6 个高频小词 + 听音辨字/音/词打底。',
+      '第 91 天起语法 24 讲循环（重点时态、非谓语、从句、词性转换）+ 每天约 14 个大纲核心词 + 阅读判断/阅读选择入门 + 复习或游戏隔天交替。',
+      '每天固定：语法或词汇巩固 + 约 12 个词 + 七大题型八天一循环（阅读判断 → 阅读选择 → 概括补全 → 填句补文 → 填词补文 → 完形补文 → 写作 → 完整模考）+ 复习交替。',
+      '每天固定：词汇巩固 + 减量新词 + 整套真题模考轮换 + 错题与高频词再巩固 + 作文模板默写，按 100 分制估分，目标稳定 60 分以上。'
+    ].map((tpl, i) => '<div class="card" style="margin-bottom:10px;box-shadow:none"><b>第 ' + (i + 1) + ' 阶段 · ' + ZX2_PHASES[i].name + '（第 ' + ZX2_PHASES[i].days[0] + '–' + ZX2_PHASES[i].days[1] + ' 天）</b><p class="muted" style="margin:6px 0 0">' + tpl + '</p></div>').join('');
+    const countdown = Math.max(0, daysBetween(dateKey(), ZX2_EXAM_DATE));
+    $('#view-plan').innerHTML =
+      '<div class="section-title" style="margin-top:4px"><h2>🗺️ 英语二备考路线图</h2><span class="hint">只认识字母 → 自考英语二 60 分</span></div>' +
+      '<div class="timeline-note"><span style="font-size:22px">🎓</span><div><b>目标：2027 年 10 月通过自考英语二（00015），满分 100、60 分及格；距考试还有 ' + countdown + ' 天</b><br>按你「只认字母」的起点固定安排：先补字母音 → 音标 → 自然拼读，再铺 2000 核心高频词与考试语法，最后按七大题型（阅读判断/选择/概括补全/填句补文/填词补文/完形补文/写作）轮训并做整套真题。每天目标 ' + state.minutes + ' 分钟，首页显示今日预计用时；四级完整工具都保留，可在「我的」切换。</div></div>' +
+      '<div class="card" style="margin-bottom:16px"><div class="progress-meta" style="color:var(--sub)"><span>当前进度</span><span>第 ' + day + ' 天 / ' + total + ' 天</span></div><div class="progress"><i style="width:' + clamp(day / total * 100, 0, 100) + '%"></i></div></div>' +
+      phases +
+      '<div class="section-title"><h2>📅 每天固定做什么</h2><span class="hint">按顺序做，不用自己挑</span></div>' +
+      '<div class="timeline-note"><span style="font-size:20px">✅</span><div>从你设定的开始日期算起，第 1 天到第 ' + total + ' 天，每天四项固定内容都是预先定好的。另外，学过的单词、语法、音标和字母会按 1 / 3 / 7 / 15 天的间隔自动加入当天计划，成为第 5 项「今日到期复习」。英语二为笔试，不考听力口语。每天预计时长见首页，题型日会自动减少新词。</div></div>' +
+      templates +
+      '<div class="card" style="margin-bottom:16px"><h3>🔎 查看任意一天的任务</h3><p class="muted">输入 1–' + total + ' 的天号，提前看看那天具体学什么。</p>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><input id="viewDayInput" type="number" min="1" max="' + total + '" value="' + (day || 1) + '" style="flex:1;min-width:110px;padding:11px 12px;border:2px solid var(--line);border-radius:12px">' +
+        '<button class="btn primary" data-action="viewDay">查看这一天 →</button></div></div>' +
+      '<div class="section-title"><h2>🗓️ 未来 7 天安排</h2><span class="hint">固定任务 + 按遗忘曲线到期的复习</span></div>' + upcoming +
+      '<div class="card" style="margin-top:16px"><h3>📌 英语二关键节点</h3><p class="muted">第 45 天：完成字母音、音标与拼读 · 第 135 天：2000 核心词与考试语法过完 · 第 136 天起：七大题型专项 · 第 276 天起：整套真题模考 · 第 ' + total + ' 天：冲刺应考。考试日：' + ZX2_EXAM_DATE + '。</p></div>';
+  }
+
+  function renderPlanPETS3() {
+    const day = state.dayIndex;
+    const total = PETS3_DAYS;
+    const phases = PETS3_PHASES.map(p => {
+      const cur = p.id === phaseOf().id;
+      const pct = clamp(Math.round((day - p.days[0] + 1) / (p.days[1] - p.days[0] + 1) * 100), 0, 100);
+      return '<div class="phase-card ' + p.color + (cur ? ' current' : '') + '">' +
+        '<div class="phase-top"><h3>第 ' + p.id + ' 阶段 · ' + p.name + (cur ? ' <span class="badge purple">进行中</span>' : '') + '</h3>' +
+        '<span class="muted">第 ' + p.days[0] + ' – ' + p.days[1] + ' 天</span></div>' +
+        '<div class="phase-goal">🎯 ' + esc(p.goal) + '</div>' +
+        '<div class="phase-desc">' + esc(p.desc) + '</div>' +
+        '<div class="tag-row">' + p.focus.map(f => '<span class="tag">' + esc(f) + '</span>').join('') + '</div>' +
+        '<div class="progress" style="background:#EEF0F7;margin-top:12px"><i style="width:' + pct + '%"></i></div></div>';
+    }).join('');
+    const upcoming = Array.from({ length: 7 }, (_, i) => Math.max(1, day || 1) + i).map(n => {
+      const t = dailyTasks(n);
+      return '<div class="card" style="margin-bottom:10px;box-shadow:none">' +
+        '<div class="phase-top"><h3>第 ' + n + ' 天' + (n === day ? ' <span class="badge purple">今天</span>' : '') + '</h3><span class="muted">' + phaseOf(n).name + ' · ' + t.length + ' 项 · 约 ' + planMinutes(n) + ' 分钟</span></div>' +
+        '<div class="tag-row">' + t.map(x => '<span class="tag">' + x.icon + ' ' + esc(x.name) + '：' + esc(x.desc.length > 26 ? x.desc.slice(0, 26) + '…' : x.desc) + '</span>').join('') + '</div></div>';
+    }).join('');
+    const templates = [
+      '第 1–6 天字母音 → 第 7–28 天每天 2 个音标 → 第 29–45 天音标巩固 → 第 46–90 天自然拼读；每天配高频小词与听音辨字/音/词打底。',
+      '第 91 天起语法逐讲循环 + 每天约 9 个大纲核心词；PETS-3 要求的听力 25 题、完形填空与阅读配伍开始入门。',
+      '每天固定：语法或词汇巩固 + 约 8 个词 + 八天循环训练听力 → 知识运用 → 阅读 → 配伍 → 改错 → 写作 → 口试 → 完整模考。',
+      '每天固定：词汇巩固 + 减量新词 + PETS-3 整套模考轮换 + 作文模板默写 + 口试话题，按 100 分制估分，目标稳定 60 分以上。'
+    ].map((tpl, i) => '<div class="card" style="margin-bottom:10px;box-shadow:none"><b>第 ' + (i + 1) + ' 阶段 · ' + PETS3_PHASES[i].name + '（第 ' + PETS3_PHASES[i].days[0] + '–' + PETS3_PHASES[i].days[1] + ' 天）</b><p class="muted" style="margin:6px 0 0">' + tpl + '</p></div>').join('');
+    const countdown = Math.max(0, daysBetween(dateKey(), PETS3_EXAM_DATE));
+    $('#view-plan').innerHTML =
+      '<div class="section-title" style="margin-top:4px"><h2>🗺️ PETS-3 备考路线图</h2><span class="hint">只认识字母 → PETS-3 笔试 60 分</span></div>' +
+      '<div class="timeline-note"><span style="font-size:22px">🎓</span><div><b>目标：2028 年 3 月通过 PETS-3 笔试，满分 100、60 分及格；暂定考试日 ' + PETS3_EXAM_DATE + '，距考试还有 ' + countdown + ' 天</b><br>官方 2028 年公告尚未发布，暂按 2025/2026 上半年笔试均在 3 月第三个周六推算，公布后可调整。按你「只认字母」的起点固定安排：先补字母音 → 音标 → 自然拼读，再铺 4000 词（PETS-3 大纲词汇量）与考试语法，最后按 PETS-3 笔试四部分 + 口试话题轮训并做整套真题。英语二专项工具也全部保留，可在学习页随时复习。</div></div>' +
+      '<div class="card" style="margin-bottom:16px"><div class="progress-meta" style="color:var(--sub)"><span>当前进度</span><span>第 ' + day + ' 天 / ' + total + ' 天</span></div><div class="progress"><i style="width:' + clamp(day / total * 100, 0, 100) + '%"></i></div></div>' +
+      phases +
+      '<div class="section-title"><h2>📅 每天固定做什么</h2><span class="hint">按顺序做，不用自己挑</span></div>' +
+      '<div class="timeline-note"><span style="font-size:20px">✅</span><div>从你设定的开始日期算起，第 1 天到第 ' + total + ' 天，每天四项固定内容都是预先定好的。学过的单词、语法、音标和字母会按 1 / 7 天的间隔自动加入当天计划，成为第 5 项「今日到期复习」。PETS-3 笔试不考翻译，但有口试话题专项。每天预计时长见首页，题型日会自动减少新词。</div></div>' +
+      templates +
+      '<div class="card" style="margin-bottom:16px"><h3>🔎 查看任意一天的任务</h3><p class="muted">输入 1–' + total + ' 的天号，提前看看那天具体学什么。</p>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><input id="viewDayInput" type="number" min="1" max="' + total + '" value="' + (day || 1) + '" style="flex:1;min-width:110px;padding:11px 12px;border:2px solid var(--line);border-radius:12px">' +
+        '<button class="btn primary" data-action="viewDay">查看这一天 →</button></div></div>' +
+      '<div class="section-title"><h2>🗓️ 未来 7 天安排</h2><span class="hint">固定任务 + 按遗忘曲线到期的复习</span></div>' + upcoming +
+      '<div class="card" style="margin-top:16px"><h3>📌 PETS-3 关键节点</h3><p class="muted">第 60 天：字母音、音标与拼读完成 · 第 180 天：4000 词与考试语法过完 · 第 181 天起：笔试四部分 + 口试八天循环 · 第 381 天起：整套模考训练 · 第 ' + total + ' 天：冲刺应考。暂定考试日：' + PETS3_EXAM_DATE + '。</p></div>';
+  }
+
   function renderPlan() {
+    if (examMode() === 'zx2') return renderPlanZX2();
+    if (examMode() === 'pets3') return renderPlanPETS3();
     const day = state.dayIndex;
     const total = totalDays();
     const n90 = realDayOf(90), n365 = realDayOf(365), n547 = realDayOf(547);
@@ -1412,6 +1824,9 @@ const App = (function () {
   }
   function renderMe() {
     const scores = state.mockScores.slice(-5);
+    const mode = examMode();
+    const isZX2 = mode === 'zx2';
+    const isPETS3 = mode === 'pets3';
     $('#view-me').innerHTML =
       '<div class="section-title" style="margin-top:4px"><h2>⚙️ 个人设置</h2><span class="hint">数据保存在本机</span></div>' +
       '<div class="card">' +
@@ -1433,22 +1848,32 @@ const App = (function () {
       '</div>' +
       '<div class="card"><h3>🎯 学习画像</h3>' +
         '<div class="info-row"><span class="label">当前水平</span><span class="value">只认识字母（按你的情况固定，无需选择）</span></div>' +
-        '<div class="info-row"><span class="label">起步内容</span><span class="value">字母音 → 音标 → 自然拼读 → 语法 → 四级题型</span></div>' +
-        '<div class="info-row"><span class="label">目标</span><span class="value">大学英语四级 CET-4 · 4642 词完整词库</span></div>' +
-        '<div class="info-row"><span class="label">每日安排</span><span class="value">目标 ' + state.minutes + ' 分钟 · 今日预计 ' + planMinutes(state.dayIndex) + ' 分钟 · 4 项固定任务 + 到期复习（重任务日已减词）</span></div>' +
-        '<p class="muted" style="font-size:11px">计划已按你「只认识字母、不认识音标/单词/语法/句子」的真实情况固定。670 天完整计划覆盖全部 4642 词、全部四级题型与到期复习；最低 30 分钟档，低于 30 分钟无法保证完整覆盖。模考当天新词自动减量，想更从容可选 45 分钟档。</p></div>' +
+        '<div class="info-row"><span class="label">起步内容</span><span class="value">字母音 → 音标 → 自然拼读 → 语法 → ' + (isZX2 ? '英语二七大题型' : (isPETS3 ? 'PETS-3 笔试四部分 + 口试' : '四级题型（计划已暂停）')) + '</span></div>' +
+        '<div class="info-row"><span class="label">目标</span><span class="value">' + (isZX2 ? '自考英语二 00015 · 2027 年 10 月 · 60 分及格' : (isPETS3 ? 'PETS-3 · 2028 年 3 月（暂定 ' + PETS3_EXAM_DATE + '）· 60 分及格' : '大学英语四级 CET-4 · 计划已暂停，工具保留')) + '</span></div>' +
+        '<div class="info-row"><span class="label">每日安排</span><span class="value">目标 ' + state.minutes + ' 分钟 · 今日预计 ' + planMinutes(state.dayIndex) + ' 分钟 · 4 项固定任务 + 到期复习（题型/模考日已减词）</span></div>' +
+        '<p class="muted" style="font-size:11px">' + (isZX2
+          ? '计划已按你「只认字母」的真实情况固定为英语二备考：330 天四阶段，覆盖大纲 4500 词 + 考试语法 + 七大题型轮训 + 整套真题模考；PETS-3 与四级工具全部保留。'
+          : (isPETS3
+            ? '计划已按你「只认字母」的真实情况固定为 PETS-3 备考：476 天四阶段，覆盖大纲 4000 词 + 考试语法 + 听力/知识运用/阅读/配伍/改错/写作/口试轮训 + 整套模考。英语二专项也保留在学习页，可随时复习；四级学习计划已暂停。'
+            : '四级学习计划已暂停；完整四级工具（4642 词、听力、阅读、写作、翻译、模考、错题本）仍可在学习页打开复习。')) + '</p></div>' +
       '<div class="card"><h3>🔊 调整设置</h3>' +
-        '<label class="onboard-label">学习目标</label><select id="setTarget" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
-          '<option value="cet4"' + (state.target === 'cet4' ? ' selected' : '') + '>大学英语四级 CET-4（4642 词完整词库）</option></select>' +
+        '<label class="onboard-label">学习目标（切换会重新计算每日计划）</label><select id="setTarget" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
+          '<option value="zx2"' + (isZX2 ? ' selected' : '') + '>自考英语二 00015（330 天 · 2027 年 10 月）</option>' +
+          '<option value="pets3"' + (isPETS3 ? ' selected' : '') + '>PETS-3 公共英语三级（476 天 · 2028 年 3 月 · 推荐新增）</option></select>' +
+        '<p class="muted" style="font-size:11px">四级学习计划已暂停，不在日常目标切换中；四级完整工具仍保留在「学习」页可随时复习。</p>' +
         '<label class="onboard-label">人声自然度（推荐开启）</label><select id="setNaturalVoice" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
           '<option value="1"' + (state.naturalVoice !== false ? ' selected' : '') + '>开启：优先真人/神经语音，按句意自然停顿</option>' +
           '<option value="0"' + (state.naturalVoice === false ? ' selected' : '') + '>关闭：使用风格化语音（变声效果）</option></select>' +
         '<div style="margin:8px 0"><button class="btn sm" data-action="tryNatural">🔊 试听自然语音</button></div>' +
         '<label class="onboard-label">开始日期（修改后重新计算计划）</label><input type="date" id="setStart" value="' + esc(state.startDate || '') + '" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
         '<label class="onboard-label">计划总周期</label><select id="setTargetDays" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
-          [[670, '670 天（22 个月 · 完整四级计划）']].map(d => '<option value="' + d[0] + '"' + (d[0] === totalDays() ? ' selected' : '') + '>' + d[1] + '</option>').join('') + '</select>' +
+          (isZX2
+            ? [[330, '330 天（英语二 · 到 2027 年 10 月考试）']]
+            : (isPETS3 ? [[476, '476 天（PETS-3 · 到 2028 年 3 月考试）']] : [[670, '670 天（四级计划已暂停，仅工具保留）']])).map(d => '<option value="' + d[0] + '"' + (d[0] === totalDays() ? ' selected' : '') + '>' + d[1] + '</option>').join('') + '</select>' +
         '<label class="onboard-label">每日目标时长</label><select id="setMinutes" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
-          [[30, '30 分钟'], [33, '33 分钟（推荐）'], [45, '45 分钟（从容）'], [60, '60 分钟（冲刺）']].map(m => '<option value="' + m[0] + '"' + (m[0] === state.minutes ? ' selected' : '') + '>' + m[1] + '</option>').join('') + '</select>' +
+          (isZX2 || isPETS3
+            ? [[30, '30 分钟'], [33, '33 分钟'], [45, '45 分钟（推荐）'], [60, '60 分钟（冲刺）']]
+            : [[30, '30 分钟'], [33, '33 分钟'], [45, '45 分钟'], [60, '60 分钟']]).map(m => '<option value="' + m[0] + '"' + (m[0] === state.minutes ? ' selected' : '') + '>' + m[1] + '</option>').join('') + '</select>' +
         '<label class="onboard-label">语音朗读速度</label><select id="setRate" style="width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:12px">' +
           [[0.7, '慢速 0.7x'], [0.85, '标准 0.85x'], [1, '正常 1.0x'], [1.15, '快速 1.15x']].map(r => '<option value="' + r[0] + '"' + (Math.abs(r[0] - state.rate) < .01 ? ' selected' : '') + '>' + r[1] + '</option>').join('') + '</select>' +
         '<label class="onboard-label">🔊 朗读语音包（像地图语音一样挑一个）</label>' +
@@ -1568,7 +1993,7 @@ const App = (function () {
       ex.cards = C.idx ? C.idx.map(i => BLEND_LESSONS[i % BLEND_LESSONS.length]) : pick(BLEND_LESSONS, 3);
       renderBlend();
     } else if (type === 'words') {
-      const src = C.src === 'easy' ? EASY_WORDS : ALL_WORDS;
+      const src = C.src === 'easy' ? EASY_WORDS : examWords();
       if (C.start != null) ex.cards = sliceCycle(src, C.start, C.count);
       else { const count = phase.id === 1 ? 4 : 10; ex.cards = pick(wordPool(), count); }
       renderCard();
@@ -1601,13 +2026,13 @@ const App = (function () {
       ex.item = C.idx != null ? SPEAK_TOPICS[C.idx % SPEAK_TOPICS.length] : pick(SPEAK_TOPICS, 1)[0];
       renderSpeaking();
     } else if (type === 'game') {
-      const gsrc = C.src === 'easy' ? EASY_WORDS : ALL_WORDS;
+      const gsrc = C.src === 'easy' ? EASY_WORDS : examWords();
       ex.pairs = C.start != null ? sliceCycle(gsrc, C.start, C.count) : pick(wordPool().filter(w => w.cn && w.w.length < 12), 5);
       ex.left = seededShuffle(ex.pairs, seed); ex.right = seededShuffle(ex.pairs, seed + 7);
       ex.selected = null; ex.matched = []; ex.total = ex.pairs.length;
       renderGame();
     } else if (type === 'review') {
-      const pool = C.src === 'easy' ? EASY_WORDS : ALL_WORDS;
+      const pool = C.src === 'easy' ? EASY_WORDS : examWords();
       ex.questions = C.start != null
         ? makeWordQuestions(sliceCycle(pool, C.start, C.count), C.count, seed)
         : makeWordQuestions(pool, 5, seed);
@@ -1641,6 +2066,52 @@ const App = (function () {
       openTranslationExercise(C.id, taskId);
     } else if (type === 'mockFull') {
       openFullMock(taskId);
+    } else if (type === 'zx2Judge') {
+      ex.questions = makeZX2Judge(ZX2_JUDGE[(seed - 1) % ZX2_JUDGE.length]);
+      renderQuiz('✅ 英语二·阅读判断', '读短文，判断每个句子是否正确（10 分题型）');
+    } else if (type === 'zx2Read') {
+      ex.questions = makeZX2Read(ZX2_READ[(seed - 1) % ZX2_READ.length]);
+      renderQuiz('📚 英语二·阅读选择', '读短文，选择正确答案（10 分题型）');
+    } else if (type === 'zx2Summary') {
+      ex.questions = makeZX2Summary(ZX2_SUMMARY[(seed - 1) % ZX2_SUMMARY.length]);
+      renderQuiz('📝 英语二·概括补全', '概括段落大意 + 补全句子（10 分题型）');
+    } else if (type === 'zx2GapSent') {
+      ex.questions = makeZX2Fill(ZX2_GAPSENT[(seed - 1) % ZX2_GAPSENT.length], 'keys', 'why', '填句补文');
+      renderQuiz('🧩 英语二·填句补文', '为短文的空缺选择合适的句子（10 分题型）');
+    } else if (type === 'zx2GapWord') {
+      ex.questions = makeZX2Fill(ZX2_GAPWORD[(seed - 1) % ZX2_GAPWORD.length], 'keys', 'why', '填词补文');
+      renderQuiz('🔤 英语二·填词补文', '为短文的空缺选择合适的词（15 分题型）');
+    } else if (type === 'zx2Cloze') {
+      ex.questions = makeZX2Fill(ZX2_CLOZE[(seed - 1) % ZX2_CLOZE.length], 'keys', 'why', '完形补文');
+      renderQuiz('✏️ 英语二·完形补文', '用括号里单词的正确形式填空（15 分题型）');
+    } else if (type === 'zx2Writing') {
+      const w = ZX2_WRITING[(seed - 1) % ZX2_WRITING.length];
+      openZX2Writing(w.id, taskId);
+    } else if (type === 'zx2Mock') {
+      openZX2Mock(taskId, seed);
+    } else if (type === 'pets3Listening') {
+      ex.questions = makePETS3Listening(PETS3_LISTENING[(seed - 1) % PETS3_LISTENING.length]);
+      renderQuiz('🎧 PETS-3·听力理解', '听短对话/独白，四选一（权重 30%）');
+    } else if (type === 'pets3Use') {
+      ex.questions = makePETS3Use(PETS3_USE[(seed - 1) % PETS3_USE.length]);
+      renderQuiz('🔤 PETS-3·英语知识运用', '完形填空，综合考词汇与语法（权重 15%）');
+    } else if (type === 'pets3Reading') {
+      ex.questions = makePETS3Read(PETS3_READ[(seed - 1) % PETS3_READ.length]);
+      renderQuiz('📚 PETS-3·阅读理解', '读短文选答案（与配伍合计权重 30%）');
+    } else if (type === 'pets3Match') {
+      ex.questions = makePETS3Match(PETS3_MATCH[(seed - 1) % PETS3_MATCH.length]);
+      renderQuiz('🧩 PETS-3·阅读配伍', '为段落匹配小标题');
+    } else if (type === 'pets3Error') {
+      ex.questions = makePETS3Error(PETS3_ERROR[(seed - 1) % PETS3_ERROR.length]);
+      renderQuiz('✏️ PETS-3·短文改错', '找出并改正句中的错误');
+    } else if (type === 'pets3Writing') {
+      const w = PETS3_WRITING[(seed - 1) % PETS3_WRITING.length];
+      openPETS3Writing(w.id, taskId);
+    } else if (type === 'pets3Speaking') {
+      const s = PETS3_SPEAK[(seed - 1) % PETS3_SPEAK.length];
+      openPETS3Speaking(s.id, taskId);
+    } else if (type === 'pets3Mock') {
+      openPETS3Mock(taskId, seed);
     }
   }
   function makeWordQuestions(pool, n, seed) {
@@ -1708,8 +2179,9 @@ const App = (function () {
     });
   }
   function makeWordListening(indices, seed) {
+    const wp = examWords();
     return indices.map((idx, i) => {
-      const w = ALL_WORDS[idx % ALL_WORDS.length];
+      const w = wp[idx % wp.length];
       if (!w || !w.cn) return null;
       const wrong = seededShuffle(ALL_WORDS.filter(x => x.w !== w.w && x.cn && x.cn !== w.cn), seed + i + 1).slice(0, 3).map(x => x.cn);
       const opts = seededShuffle([w.cn].concat(wrong), seed + i + 51);
@@ -1759,6 +2231,112 @@ const App = (function () {
   function makeCarefulQuestions(item) {
     if (!item) return [];
     return item.qs.map((q, i) => ({ id:'R:'+item.id+':'+i, q:'《'+item.title+'》'+q.q, opts:q.opts, ans:q.ans, why:q.why, type:'仔细阅读' }));
+  }
+
+  // ---------- 英语二题型题目生成 ----------
+  function zx2Passage(title, text) { return '【' + title + '】\n' + (text || ''); }
+  function makeZX2Judge(item) {
+    if (!item) return [];
+    return item.qs.map((q, i) => ({ id:'ZJ:'+item.id+':'+i,
+      q:zx2Passage(item.title, item.text) + '\n判断正误：' + q.q,
+      opts:['正确 True','错误 False'], ans:q.ans, why:q.why, type:'阅读判断' }));
+  }
+  function makeZX2Read(item) {
+    if (!item) return [];
+    return item.qs.map((q, i) => ({ id:'ZR:'+item.id+':'+i,
+      q:zx2Passage(item.title, item.text) + '\n' + q.q,
+      opts:q.opts, ans:q.ans, why:q.why, type:'阅读选择' }));
+  }
+  function makeZX2Summary(item) {
+    if (!item) return [];
+    const body = zx2Passage(item.title, item.paras.join('\n')) + '\n';
+    const head = item.paras.map((p, i) => ({ id:'ZH:'+item.id+':h'+i,
+      q:body + p.slice(0, 3) + ' 段的段落大意是？',
+      opts:item.headings, ans:item.headAns[i], why:'段落 ' + p + ' 对应标题：' + item.headings[item.headAns[i]], type:'概括段落大意' }));
+    const comp = item.comps.map((c, i) => ({ id:'ZH:'+item.id+':c'+i,
+      q:body + c.q, opts:c.opts, ans:c.ans, why:c.why, type:'补全句子' }));
+    return head.concat(comp);
+  }
+  // 通用填空：从 bank 中排除所有正确答案作为干扰项，保证选项里只有一个正确答案
+  function makeZX2Fill(item, keyField, whyField, type) {
+    if (!item) return [];
+    const keys = item[keyField] || [];
+    const why = item[whyField] || [];
+    const bank = item.bank || [];
+    const slotText = (item.text || '').split(/(__\d+__|___\d+___)/);
+    return keys.map((ans, i) => {
+      const distract = bank.filter(x => x && keys.indexOf(x) === -1);
+      const opts = seededShuffle([ans].concat(distract.slice(0, 3)), (i + 1) * 37 + ans.length).slice(0, 4);
+      while (opts.length < 4 && opts.indexOf('以上都不对') === -1) opts.push('以上都不对');
+      // 还原含空格标记的文章，并把当前空格高亮为【第 N 空】
+      const passage = slotText.map(seg => {
+        if (/^__\d+__$|^___\d+___$/.test(seg)) {
+          const n = Number(seg.replace(/[^0-9]/g, ''));
+          return n === i + 1 ? '【第 ' + n + ' 空】' : '（第 ' + n + ' 空）';
+        }
+        return seg;
+      }).join('');
+      return { id:'ZF:'+item.id+':'+(i+1),
+        q:zx2Passage(item.title, passage) + '\n第 ' + (i + 1) + ' 空应填什么？',
+        opts, ans:opts.indexOf(ans), why:(why[i] || '') + '　正确答案：' + ans, type };
+    });
+  }
+  function makeZX2MockSections(item) {
+    if (!item) return [];
+    const sections = [
+      { name:'阅读判断', qs:makeZX2Judge(item.judge) },
+      { name:'阅读选择', qs:makeZX2Read(item.read) },
+      { name:'概括补全', qs:makeZX2Summary(item.summary) },
+      { name:'填句补文', qs:makeZX2Fill(item.gapSent, 'keys', 'why', '填句补文') },
+      { name:'填词补文', qs:makeZX2Fill(item.gapWord, 'keys', 'why', '填词补文') },
+      { name:'完形补文', qs:makeZX2Fill(item.cloze, 'keys', 'why', '完形补文') }
+    ];
+    const out = [];
+    sections.forEach(sec => sec.qs.forEach(q => { q.section = sec.name; out.push(q); }));
+    return out;
+  }
+
+  // ---------- PETS-3 题型题目生成 ----------
+  function pets3Passage(title, text) { return '【' + title + '】\n' + (text || ''); }
+  function makePETS3Listening(item) {
+    if (!item) return [];
+    return item.qs.map((q, i) => ({ id:'PL:'+item.id+':'+i,
+      q:pets3Passage(item.title, q.audio || item.text || '') + '\n' + q.q,
+      opts:q.opts, ans:q.ans, why:q.why, audio:q.audio || item.text || '', type:'听力理解' }));
+  }
+  function makePETS3Use(item) {
+    if (!item) return [];
+    const parts = (item.text || '').split(/(__\d+__)/);
+    return item.keys.map((ans, i) => {
+      const opts = (item.opts && item.opts[i]) || [];
+      const passage = parts.map(seg => {
+        if (/^__\d+__$/.test(seg)) return Number(seg.replace(/\D/g, '')) === i + 1 ? '【第 ' + (i + 1) + ' 空】' : '（第 ' + seg.replace(/\D/g, '') + ' 空）';
+        return seg;
+      }).join('');
+      return { id:'PU:'+item.id+':'+(i+1),
+        q:pets3Passage(item.title, passage) + '\n第 ' + (i + 1) + ' 空应选什么？',
+        opts, ans:opts.indexOf(ans), why:(item.why && item.why[i] || '') + '　正确答案：' + ans, type:'英语知识运用' };
+    });
+  }
+  function makePETS3Read(item) {
+    if (!item) return [];
+    return item.qs.map((q, i) => ({ id:'PR:'+item.id+':'+i,
+      q:pets3Passage(item.title, item.text) + '\n' + q.q,
+      opts:q.opts, ans:q.ans, why:q.why, type:'阅读理解' }));
+  }
+  function makePETS3Match(item) {
+    if (!item) return [];
+    return item.statements.map((s, i) => ({ id:'PM:'+item.id+':'+i,
+      q:pets3Passage(item.title, item.text) + '\n' + s.q + ' 应选哪个小标题？',
+      opts:item.options, ans:s.ans, why:s.why, type:'阅读配伍' }));
+  }
+  function makePETS3Error(item) {
+    if (!item) return [];
+    return item.errors.map((e, i) => ({
+      id:'PE:'+item.id+':'+i,
+      q:pets3Passage(item.title, item.lines.map((l, n) => (n + 1 === e.line ? '第 ' + (n + 1) + ' 行：' + l : l)).join('\n')) + '\n第 ' + e.line + ' 行中的 “' + e.wrong + '” 应改为？',
+      opts:e.opts, ans:e.ans, why:(e.why || '') + '　正确答案：' + e.opts[e.ans], type:'短文改错'
+    }));
   }
   function dots() {
     if (!ex.questions) return '';
@@ -2229,11 +2807,12 @@ const App = (function () {
   function writeItems() {
     const t = dailyTasks().find(x => x.id === 'b');
     const cfg = t && t.cfg;
-    const today = cfg ? sliceCycle(ALL_WORDS, cfg.start, cfg.count) : ALL_WORDS.slice(0, 8);
+    const todayPool = examWords();
+    const today = cfg ? sliceCycle(todayPool, cfg.start, cfg.count) : todayPool.slice(0, 8);
     const items = [];
     today.forEach(w => items.push({ kind: '今日单词', text: w.w, sub: w.cn + (w.ph ? ' ' + w.ph : '') }));
     LETTERS.forEach(l => items.push({ kind: '字母', text: l.letter, sub: l.ph + ' · ' + l.ex + ' ' + l.cn }));
-    ALL_WORDS.slice(0, 20).forEach(w => items.push({ kind: '常用词', text: w.w, sub: w.cn }));
+    todayPool.slice(0, 20).forEach(w => items.push({ kind: '常用词', text: w.w, sub: w.cn }));
     return items;
   }
   /* ---------- 默写测验：听朗读 + 看中文 → 手写 → 自己对照答案 ---------- */
@@ -2243,7 +2822,7 @@ const App = (function () {
     const items = [];
     const t = dailyTasks().find(x => x.id === 'b');
     const cfg = t && t.cfg;
-    const src = all ? ALL_WORDS : (cfg && cfg.src === 'easy' ? EASY_WORDS : ALL_WORDS);
+    const src = all ? ALL_WORDS : (cfg && cfg.src === 'easy' ? EASY_WORDS : examWords());
     const start = cfg ? cfg.start : 0;
     const wordPool = all ? seededShuffle(ALL_WORDS.filter(w => w.cn), S).slice(0, 4)
       : sliceCycle(src, start, cfg ? cfg.count : 8).filter(w => w.cn);
@@ -2732,6 +3311,259 @@ const App = (function () {
     fm = null;
   }
 
+  /* ---------- 英语二写作（30 分题型） ---------- */
+  let zx2wState = null;
+  function openZX2Writing(id, taskId) {
+    const item = ZX2_WRITING.find(x => x.id === id) || ZX2_WRITING[0];
+    zx2wState = { item, taskId: taskId || null };
+    const prev = state.writings['zx2_' + item.id];
+    openModal(modalHead('✍️ 英语二写作 · ' + esc(item.title)) +
+      '<div class="reward-banner">' + esc(item.prompt) + '</div>' +
+      '<textarea id="zx2WriteText" rows="10" placeholder="在这里写你的作文（英语二要求 100–120 词）" style="width:100%;padding:12px;border:2px solid var(--line);border-radius:12px;line-height:1.6">' + esc(prev ? prev.text : '') + '</textarea>' +
+      '<p class="muted" style="font-size:12px">写完点提交，对照范文与中文意思。英语二写作满分 30 分，字数够、句子通顺、结构清楚就能拿到基础分。' + (taskId ? '本任务按写作完成度发积分。' : '自由练习不计积分。') + '</p>' +
+      '<button class="btn primary big" data-action="zx2WriteSubmit">提交并看范文 →</button>');
+  }
+  function submitZX2Writing() {
+    if (!zx2wState) return;
+    const item = zx2wState.item;
+    const text = ($('#zx2WriteText') && $('#zx2WriteText').value || '').trim();
+    const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+    if (words < 20) { toast('再多写几句吧，至少 20 词才能对照范文'); return; }
+    const lower = text.toLowerCase();
+    const phrases = (item.phrases || []).filter(p => lower.indexOf(String(p).toLowerCase()) !== -1).length;
+    const score = clamp(Math.round(words / 120 * 70 + phrases * 8), 0, 100);
+    state.writings['zx2_' + item.id] = { text, words, score, t:dateKey() };
+    saveState();
+    const gained = zx2wState.taskId ? awardTaskScore(zx2wState.taskId, score, 100) : 0;
+    const gainLine = zx2wState.taskId
+      ? (gained > 0 ? '+' + gained + ' XP（完成度 ' + score + ' 分）' : '本次完成度 ' + score + ' 分，修改后再提交可补差额')
+      : '自由练习不计积分。';
+    openModal(modalHead('✅ 写作已保存 · ' + esc(item.title)) +
+      '<div class="reward-banner">你写了 ' + words + ' 词 · ' + (words >= 100 ? '达到英语二作文长度要求' : '建议写到 100–120 词') + ' · ' + gainLine + '</div>' +
+      '<div class="arch-item"><div class="arch-main">参考范文</div><div class="arch-sub">' + esc(item.model) + '</div>' +
+      '<div class="arch-cn">中文意思：' + esc(item.modelCn) + '</div>' +
+      '<div class="arch-foot"><button class="btn sm" data-action="speak" data-text="' + esc(item.model) + '">🔊 听范文</button></div></div>' +
+      '<div class="arch-item"><div class="arch-main">可套用词组</div>' + item.phrases.map(p => '<div class="arch-sub">· ' + esc(p) + '</div>').join('') + '</div>' +
+      '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" data-action="zx2WriteAgain">再写一遍</button><button class="btn" data-action="close">返回</button></div>');
+  }
+
+  /* ---------- 英语二完整真题模考（按 100 分制） ---------- */
+  let zxm = null;
+  function openZX2Mock(taskId, seed) {
+    const paper = window.makeZX2Mock(seed || Date.now());
+    zxm = { paper, sec:0, idx:0, answers:{}, writing:'', taskId: taskId || null };
+    renderZX2Mock();
+  }
+  function zxmSection() {
+    const p = zxm.paper;
+    if (zxm.sec === 0) return { name:'阅读判断（10 分）', qs:makeZX2Judge(p.judge) };
+    if (zxm.sec === 1) return { name:'阅读选择（10 分）', qs:makeZX2Read(p.read) };
+    if (zxm.sec === 2) return { name:'概括补全（10 分）', qs:makeZX2Summary(p.summary) };
+    if (zxm.sec === 3) return { name:'填句补文（10 分）', qs:makeZX2Fill(p.gapSent, 'keys', 'why', '填句补文') };
+    if (zxm.sec === 4) return { name:'填词补文（15 分）', qs:makeZX2Fill(p.gapWord, 'keys', 'why', '填词补文') };
+    if (zxm.sec === 5) return { name:'完形补文（15 分）', qs:makeZX2Fill(p.cloze, 'keys', 'why', '完形补文') };
+    return null;
+  }
+  function renderZX2Mock() {
+    if (!zxm) return;
+    const head = modalHead('📋 英语二真题模考') +
+      '<div class="reward-banner">完整流程：阅读判断 → 阅读选择 → 概括补全 → 填句补文 → 填词补文 → 完形补文 → 写作（30 分），满分 100、60 分及格。' + (zxm.taskId ? '按正确量发积分' : '自由模考不计积分') + '</div>';
+    const sec = zxmSection();
+    if (sec) {
+      const q = sec.qs[zxm.idx];
+      if (!q) { zxm.sec++; zxm.idx = 0; renderZX2Mock(); return; }
+      const key = zxm.sec + ':' + zxm.idx;
+      openModal(head + '<p class="muted">' + sec.name + ' · 第 ' + (zxm.idx + 1) + '/' + sec.qs.length + ' 题</p>' +
+        '<div class="quiz-q">' + esc(q.q).replace(/\n/g, '<br>') + '</div>' +
+        '<div class="opts">' + q.opts.map((o, i) => '<button class="opt' + (zxm.answers[key] === i ? ' right' : '') + '" data-action="zx2MockOpt" data-i="' + i + '">' + String.fromCharCode(65 + i) + '. ' + esc(o) + '</button>').join('') + '</div>' +
+        '<div style="margin-top:12px"><button class="btn primary" data-action="zx2MockNext">' + (zxm.idx < sec.qs.length - 1 ? '下一题 →' : '完成本部分 →') + '</button></div>');
+      return;
+    }
+    if (zxm.sec === 6) {
+      const w = zxm.paper.writing;
+      openModal(head + '<div class="reward-banner">' + esc(w.prompt) + '</div>' +
+        '<textarea id="zx2MockWrite" rows="10" style="width:100%;padding:12px;border:2px solid var(--line);border-radius:12px">' + esc(zxm.writing) + '</textarea>' +
+        '<button class="btn primary big" data-action="zx2MockSubmit">交卷并查看成绩 →</button>');
+      return;
+    }
+    finishZX2Mock();
+  }
+  function finishZX2Mock() {
+    if (!zxm) return;
+    const p = zxm.paper;
+    const sections = [
+      { name:'阅读判断', qs:makeZX2Judge(p.judge), full:10 },
+      { name:'阅读选择', qs:makeZX2Read(p.read), full:10 },
+      { name:'概括补全', qs:makeZX2Summary(p.summary), full:10 },
+      { name:'填句补文', qs:makeZX2Fill(p.gapSent, 'keys', 'why', '填句补文'), full:10 },
+      { name:'填词补文', qs:makeZX2Fill(p.gapWord, 'keys', 'why', '填词补文'), full:15 },
+      { name:'完形补文', qs:makeZX2Fill(p.cloze, 'keys', 'why', '完形补文'), full:15 }
+    ];
+    let score = 0, right = 0, total = 0;
+    const rows = sections.map((sec, si) => {
+      let r = 0;
+      sec.qs.forEach((q, i) => { total++; if (zxm.answers[si + ':' + i] === q.ans) { r++; right++; } });
+      const s = sec.qs.length ? Math.round(r / sec.qs.length * sec.full) : 0;
+      score += s;
+      return { name:sec.name, right:r, total:sec.qs.length, score:s, full:sec.full };
+    });
+    const text = (zxm.writing || '').trim();
+    const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+    const lower = text.toLowerCase();
+    const phrases = (p.writing.phrases || []).filter(x => lower.indexOf(String(x).toLowerCase()) !== -1).length;
+    const writeScore = clamp(Math.round(words / 120 * 22 + phrases * 2), 0, 30);
+    score += writeScore;
+    const gained = zxm.taskId ? awardTaskScore(zxm.taskId, score, 100) : 0;
+    const gainLine = zxm.taskId
+      ? (gained > 0 ? ' · +' + gained + ' XP' : ' · 本次未得新积分，重做可补差额')
+      : ' · 自由模考不计积分';
+    state.mockScores.push({ date:dateKey(), score, exam:'zx2', detail:{ objective:right + '/' + total, writing:writeScore } });
+    saveState();
+    openModal(modalHead('📊 英语二模考成绩') +
+      '<div class="reward-banner" style="font-size:22px">' + score + ' / 100 分 · ' + (score >= 60 ? '达到及格线 🎉' : '继续努力，距及格还差 ' + (60 - score) + ' 分') + gainLine + '</div>' +
+      rows.map(r => '<div class="arch-item"><div class="arch-main">' + r.name + '</div><div class="arch-sub">答对 ' + r.right + '/' + r.total + ' 题 · 得分 ' + r.score + '/' + r.full + '</div></div>').join('') +
+      '<div class="arch-item"><div class="arch-main">写作（30 分）</div><div class="arch-sub">' + words + ' 词 · 参考分 ' + writeScore + '</div><div class="arch-sub">' + esc(p.writing.model) + '</div></div>' +
+      '<p class="muted" style="font-size:12px">写作参考分按字数与词组覆盖粗略计算，请对照范文自行判断。</p>' +
+      '<div style="margin-top:12px"><button class="btn primary big" data-action="close">完成</button></div>');
+    zxm = null;
+  }
+
+  /* ---------- PETS-3 写作（书面表达 15 分） ---------- */
+  let pets3wState = null;
+  function openPETS3Writing(id, taskId) {
+    const item = PETS3_WRITING.find(x => x.id === id) || PETS3_WRITING[0];
+    pets3wState = { item, taskId: taskId || null };
+    const prev = state.writings['pets3_' + item.id];
+    openModal(modalHead('✍️ PETS-3 写作 · ' + esc(item.title)) +
+      '<div class="reward-banner">' + esc(item.kind) + '：' + esc(item.prompt) + '</div>' +
+      '<textarea id="pets3WriteText" rows="10" placeholder="在这里写你的作文（PETS-3 书信约 100 词，情景作文约 120 词）" style="width:100%;padding:12px;border:2px solid var(--line);border-radius:12px;line-height:1.6">' + esc(prev ? prev.text : '') + '</textarea>' +
+      '<p class="muted" style="font-size:12px">写完点提交，对照范文与中文意思。' + (taskId ? '本任务按写作完成度发积分。' : '自由练习不计积分。') + '</p>' +
+      '<button class="btn primary big" data-action="pets3WriteSubmit">提交并看范文 →</button>');
+  }
+  function submitPETS3Writing() {
+    if (!pets3wState) return;
+    const item = pets3wState.item;
+    const text = ($('#pets3WriteText') && $('#pets3WriteText').value || '').trim();
+    const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+    if (words < 20) { toast('再多写几句吧，至少 20 词才能对照范文'); return; }
+    const lower = text.toLowerCase();
+    const phrases = (item.phrases || []).filter(p => lower.indexOf(String(p).toLowerCase()) !== -1).length;
+    const score = clamp(Math.round(words / 120 * 70 + phrases * 8), 0, 100);
+    state.writings['pets3_' + item.id] = { text, words, score, t:dateKey() };
+    saveState();
+    const gained = pets3wState.taskId ? awardTaskScore(pets3wState.taskId, score, 100) : 0;
+    const gainLine = pets3wState.taskId
+      ? (gained > 0 ? '+' + gained + ' XP（完成度 ' + score + ' 分）' : '本次完成度 ' + score + ' 分，修改后再提交可补差额')
+      : '自由练习不计积分。';
+    openModal(modalHead('✅ 写作已保存 · ' + esc(item.title)) +
+      '<div class="reward-banner">你写了 ' + words + ' 词 · ' + (words >= 100 ? '达到 PETS-3 作文长度要求' : '建议写到 100–120 词') + ' · ' + gainLine + '</div>' +
+      '<div class="arch-item"><div class="arch-main">参考范文</div><div class="arch-sub">' + esc(item.model) + '</div>' +
+      '<div class="arch-cn">中文意思：' + esc(item.modelCn) + '</div>' +
+      '<div class="arch-foot"><button class="btn sm" data-action="speak" data-text="' + esc(item.model) + '">🔊 听范文</button></div></div>' +
+      '<div class="arch-item"><div class="arch-main">可套用词组</div>' + item.phrases.map(p => '<div class="arch-sub">· ' + esc(p) + '</div>').join('') + '</div>' +
+      '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" data-action="pets3WriteAgain">再写一遍</button><button class="btn" data-action="close">返回</button></div>');
+  }
+
+  /* ---------- PETS-3 口试模拟 ---------- */
+  let pets3sState = null;
+  function openPETS3Speaking(id, taskId) {
+    const item = PETS3_SPEAK.find(x => x.id === id) || PETS3_SPEAK[0];
+    pets3sState = { item, taskId: taskId || null };
+    openModal(modalHead('🎤 PETS-3 口试模拟 · ' + esc(item.title)) +
+      '<div class="reward-banner">' + esc(item.q) + '</div>' +
+      '<p class="muted">先自己开口回答 1 分钟；说完再点下面按钮看参考回答和中文意思。' + (taskId ? '本任务按完成度发积分。' : '自由练习不计积分。') + '</p>' +
+      '<div style="margin-top:12px"><button class="btn primary big" data-action="pets3SpeakDone">我说完了，看参考回答 →</button></div>');
+  }
+  function submitPETS3Speaking() {
+    if (!pets3sState) return;
+    const item = pets3sState.item;
+    const gained = pets3sState.taskId ? awardTaskScore(pets3sState.taskId, 100, 100) : 0;
+    const gainLine = pets3sState.taskId ? (gained > 0 ? '+' + gained + ' XP' : '本次已拿满，重做不重复给分') : '自由练习不计积分。';
+    openModal(modalHead('✅ 口试练习完成 · ' + esc(item.title)) +
+      '<div class="reward-banner">' + gainLine + '</div>' +
+      '<div class="arch-item"><div class="arch-main">参考回答</div><div class="arch-sub">' + esc(item.model) + '</div>' +
+      '<div class="arch-cn">中文意思：' + esc(item.modelCn) + '</div>' +
+      '<div class="arch-foot"><button class="btn sm" data-action="speak" data-text="' + esc(item.model) + '">🔊 听参考回答</button></div></div>' +
+      '<div class="arch-item"><div class="arch-main">可套用表达</div>' + item.phrases.map(p => '<div class="arch-sub">· ' + esc(p) + '</div>').join('') + '</div>' +
+      '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" data-action="pets3SpeakAgain">再练一遍</button><button class="btn" data-action="close">返回</button></div>');
+  }
+
+  /* ---------- PETS-3 完整模考（笔试按 100 分制，口试话题附在成绩页） ---------- */
+  let p3m = null;
+  function openPETS3Mock(taskId, seed) {
+    const paper = window.makePETS3Mock(seed || Date.now());
+    p3m = { paper, sec:0, idx:0, answers:{}, writing:'', taskId: taskId || null };
+    renderPETS3Mock();
+  }
+  function p3mSection() {
+    const p = p3m.paper;
+    if (p3m.sec === 0) return { name:'听力理解（30 分）', qs:makePETS3Listening(p.listening) };
+    if (p3m.sec === 1) return { name:'英语知识运用（15 分）', qs:makePETS3Use(p.use) };
+    if (p3m.sec === 2) return { name:'阅读理解（20 分）', qs:makePETS3Read(p.read) };
+    if (p3m.sec === 3) return { name:'阅读配伍（10 分）', qs:makePETS3Match(p.match) };
+    if (p3m.sec === 4) return { name:'短文改错（10 分）', qs:makePETS3Error(p.error) };
+    return null;
+  }
+  function renderPETS3Mock() {
+    if (!p3m) return;
+    const head = modalHead('📋 PETS-3 完整模考') +
+      '<div class="reward-banner">笔试：听力 30 → 知识运用 15 → 阅读 20 → 配伍 10 → 改错 10 → 写作 15，满分 100、60 分及格。' + (p3m.taskId ? '按正确量发积分' : '自由模考不计积分') + '</div>';
+    const sec = p3mSection();
+    if (sec) {
+      const q = sec.qs[p3m.idx];
+      if (!q) { p3m.sec++; p3m.idx = 0; renderPETS3Mock(); return; }
+      const key = p3m.sec + ':' + p3m.idx;
+      openModal(head + '<p class="muted">' + sec.name + ' · 第 ' + (p3m.idx + 1) + '/' + sec.qs.length + ' 题</p>' +
+        (q.audio ? '<div style="margin:8px 0"><button class="btn sm" data-action="speak" data-text="' + esc(q.audio) + '">🔊 再听一遍</button></div>' : '') +
+        '<div class="quiz-q">' + esc(q.q).replace(/\n/g, '<br>') + '</div>' +
+        '<div class="opts">' + q.opts.map((o, i) => '<button class="opt' + (p3m.answers[key] === i ? ' right' : '') + '" data-action="pets3MockOpt" data-i="' + i + '">' + String.fromCharCode(65 + i) + '. ' + esc(o) + '</button>').join('') + '</div>' +
+        '<div style="margin-top:12px"><button class="btn primary" data-action="pets3MockNext">' + (p3m.idx < sec.qs.length - 1 ? '下一题 →' : '完成本部分 →') + '</button></div>');
+      return;
+    }
+    openModal(head + '<div class="reward-banner">' + esc(p3m.paper.writing.prompt) + '</div>' +
+      '<textarea id="pets3MockWrite" rows="10" style="width:100%;padding:12px;border:2px solid var(--line);border-radius:12px">' + esc(p3m.writing) + '</textarea>' +
+      '<button class="btn primary big" data-action="pets3MockSubmit">交卷并查看成绩 →</button>');
+  }
+  function finishPETS3Mock() {
+    if (!p3m) return;
+    const p = p3m.paper;
+    const sections = [
+      { name:'听力理解', qs:makePETS3Listening(p.listening), full:30 },
+      { name:'英语知识运用', qs:makePETS3Use(p.use), full:15 },
+      { name:'阅读理解', qs:makePETS3Read(p.read), full:20 },
+      { name:'阅读配伍', qs:makePETS3Match(p.match), full:10 },
+      { name:'短文改错', qs:makePETS3Error(p.error), full:10 }
+    ];
+    let score = 0, right = 0, total = 0;
+    const rows = sections.map((sec, si) => {
+      let r = 0;
+      sec.qs.forEach((q, i) => { total++; if (p3m.answers[si + ':' + i] === q.ans) { r++; right++; } });
+      const s = sec.qs.length ? Math.round(r / sec.qs.length * sec.full) : 0;
+      score += s;
+      return { name:sec.name, right:r, total:sec.qs.length, score:s, full:sec.full };
+    });
+    const text = (p3m.writing || '').trim();
+    const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+    const lower = text.toLowerCase();
+    const phrases = (p.writing.phrases || []).filter(x => lower.indexOf(String(x).toLowerCase()) !== -1).length;
+    const writeScore = clamp(Math.round(words / 120 * 12 + phrases), 0, 15);
+    score += writeScore;
+    const gained = p3m.taskId ? awardTaskScore(p3m.taskId, score, 100) : 0;
+    const gainLine = p3m.taskId
+      ? (gained > 0 ? ' · +' + gained + ' XP' : ' · 本次未得新积分，重做可补差额')
+      : ' · 自由模考不计积分';
+    state.mockScores.push({ date:dateKey(), score, exam:'pets3', detail:{ objective:right + '/' + total, writing:writeScore } });
+    saveState();
+    openModal(modalHead('📊 PETS-3 模考成绩') +
+      '<div class="reward-banner" style="font-size:22px">' + score + ' / 100 分 · ' + (score >= 60 ? '达到及格线 🎉' : '继续努力，距及格还差 ' + (60 - score) + ' 分') + gainLine + '</div>' +
+      rows.map(r => '<div class="arch-item"><div class="arch-main">' + r.name + '</div><div class="arch-sub">答对 ' + r.right + '/' + r.total + ' 题 · 得分 ' + r.score + '/' + r.full + '</div></div>').join('') +
+      '<div class="arch-item"><div class="arch-main">写作（15 分）</div><div class="arch-sub">' + words + ' 词 · 参考分 ' + writeScore + '</div><div class="arch-sub">' + esc(p.writing.model) + '</div><div class="arch-cn">中文意思：' + esc(p.writing.modelCn) + '</div></div>' +
+      '<div class="arch-item"><div class="arch-main">附：口试话题（不计入笔试分）</div><div class="arch-sub">' + esc(p.speaking.q) + '</div><div class="arch-cn">参考回答：' + esc(p.speaking.model) + '</div><div class="arch-cn">中文意思：' + esc(p.speaking.modelCn) + '</div></div>' +
+      '<p class="muted" style="font-size:12px">写作参考分按字数与词组覆盖粗略计算，请对照范文自行判断。</p>' +
+      '<div style="margin-top:12px"><button class="btn primary big" data-action="close">完成</button></div>');
+    p3m = null;
+  }
+
   function onClick(e) {
     const nav = e.target.closest('[data-nav]');
     if (nav) { go(nav.dataset.nav); return; }
@@ -2753,6 +3585,11 @@ const App = (function () {
       else if (mod.dataset.mod === 'mockFull') openFullMock();
       else if (mod.dataset.mod === 'wrongBook') openWrongBook();
       else if (mod.dataset.mod === 'translate') openTranslate();
+      else if (mod.dataset.mod === 'zx2Writing') openZX2Writing();
+      else if (mod.dataset.mod === 'zx2Mock') openZX2Mock(null, Date.now());
+      else if (mod.dataset.mod === 'pets3Writing') openPETS3Writing();
+      else if (mod.dataset.mod === 'pets3Speaking') openPETS3Speaking();
+      else if (mod.dataset.mod === 'pets3Mock') openPETS3Mock(null, Date.now());
       else startExercise(mod.dataset.mod);
       return;
     }
@@ -2782,6 +3619,18 @@ const App = (function () {
     else if (a === 'wrongRemove') { delete state.wrongBook[el.dataset.id]; saveState(); openWrongBook(); }
     else if (a === 'writingSubmit') submitWriting();
     else if (a === 'writingAgain') { if (writingState) openWriting(writingState.item.id); }
+    else if (a === 'zx2WriteSubmit') submitZX2Writing();
+    else if (a === 'zx2WriteAgain') { if (zx2wState) openZX2Writing(zx2wState.item.id); }
+    else if (a === 'zx2MockOpt' && zxm) { zxm.answers[zxm.sec + ':' + zxm.idx] = Number(el.dataset.i); renderZX2Mock(); }
+    else if (a === 'zx2MockNext' && zxm) { zxm.idx++; renderZX2Mock(); }
+    else if (a === 'zx2MockSubmit' && zxm) { zxm.writing = ($('#zx2MockWrite') && $('#zx2MockWrite').value || '').trim(); zxm.sec = 7; renderZX2Mock(); }
+    else if (a === 'pets3WriteSubmit') submitPETS3Writing();
+    else if (a === 'pets3WriteAgain') { if (pets3wState) openPETS3Writing(pets3wState.item.id); }
+    else if (a === 'pets3SpeakDone') submitPETS3Speaking();
+    else if (a === 'pets3SpeakAgain') { if (pets3sState) openPETS3Speaking(pets3sState.item.id); }
+    else if (a === 'pets3MockOpt' && p3m) { p3m.answers[p3m.sec + ':' + p3m.idx] = Number(el.dataset.i); renderPETS3Mock(); }
+    else if (a === 'pets3MockNext' && p3m) { p3m.idx++; renderPETS3Mock(); }
+    else if (a === 'pets3MockSubmit' && p3m) { p3m.writing = ($('#pets3MockWrite') && $('#pets3MockWrite').value || '').trim(); finishPETS3Mock(); }
     else if (a === 'transExSubmit') submitTranslationExercise();
     else if (a === 'transExAgain') { if (transExState) openTranslationExercise(transExState.item.id); }
     else if (a === 'transDir') { transState.dir = el.dataset.dir; transState.q = ''; renderTranslate(); }
@@ -2900,10 +3749,16 @@ const App = (function () {
   function saveSettings() {
     const s = $('#setStart').value;
     if (s) state.startDate = s;
+    const tg = $('#setTarget');
+    const prevMode = examMode();
+    if (tg && (tg.value === 'zx2' || tg.value === 'pets3')) state.target = tg.value;
+    const newMode = examMode();
+    // 周期：英语二固定 330 天、PETS-3 固定 476 天；四级计划已暂停，仅保留工具
     const td = $('#setTargetDays');
-    if (td) state.targetDays = Number(td.value);
+    if (newMode === 'zx2') state.targetDays = ZX2_DAYS;
+    else if (newMode === 'pets3') state.targetDays = PETS3_DAYS;
+    else if (td) state.targetDays = Number(td.value) || SOURCE_DAYS;
     state.level = 'zero'; // 起点固定，不受任何旧控件影响
-    const tg = $('#setTarget'); if (tg) state.target = tg.value;
     const nv = $('#setNaturalVoice'); if (nv) state.naturalVoice = nv.value === '1';
     state.minutes = Number($('#setMinutes').value);
     state.rate = Number($('#setRate').value);
@@ -2921,7 +3776,9 @@ const App = (function () {
       const el = $('#video_' + k);
       if (el) state.videos[k] = el.value.trim();
     });
-    saveState(); render(); toast('✅ 设置已保存');
+    saveState(); render();
+    if (prevMode !== newMode) toast(newMode === 'zx2' ? '✅ 已切到英语二备考（330 天）' : '✅ 已切回四级完整计划（670 天）');
+    else toast('✅ 设置已保存');
   }
   function exportData() {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
